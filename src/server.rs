@@ -25,8 +25,9 @@ use crate::config::ServerConfig;
 use crate::error::{Error, Result};
 use crate::ids;
 use crate::models::{
-    CreateSessionPayload, FileNode, MessageInfo, MessageWithParts, Part, PromptPayload,
-    SessionInfo, assistant_message, now_ms, path_to_string, user_message,
+    CreateSessionPayload, FileNode, MessageInfo, MessageWithParts, Part, PartTime, PromptPayload,
+    SessionInfo, TextPart, ToolPart, assistant_message_pending_with_id, assistant_message_with_id,
+    now_ms, path_to_string, user_message,
 };
 use crate::opencode_routes::OPENCODE_ROUTES;
 use crate::pi_rpc::PiRpcClient;
@@ -45,6 +46,24 @@ struct SessionRecord {
     info: SessionInfo,
     rpc: Arc<PiRpcClient>,
     messages: Vec<MessageWithParts>,
+    live: LiveSessionState,
+}
+
+#[derive(Debug, Default)]
+struct LiveSessionState {
+    assistant: Option<LiveAssistant>,
+}
+
+#[derive(Debug)]
+struct LiveAssistant {
+    message_id: String,
+    parent_id: String,
+    directory: PathBuf,
+    published_message: bool,
+    parts: Vec<Part>,
+    text_parts: HashMap<String, usize>,
+    reasoning_parts: HashMap<String, usize>,
+    tool_parts: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,12 +116,13 @@ impl AppState {
             info: info.clone(),
             rpc: Arc::clone(&rpc),
             messages: Vec::new(),
+            live: LiveSessionState::default(),
         }));
         self.sessions
             .write()
             .await
             .insert(info.id.clone(), Arc::clone(&record));
-        self.forward_session_events(&info, rpc);
+        self.forward_session_events(&info, rpc, Arc::clone(&record));
         self.publish_session_updated(&info);
         Ok(info)
     }
@@ -164,6 +184,20 @@ impl AppState {
         }
     }
 
+    fn publish_message_snapshot(&self, message: &MessageWithParts) {
+        let session_id = message.info.session_id();
+        self.publish(json!({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": session_id,
+                "info": &message.info,
+            },
+        }));
+        for part in &message.parts {
+            self.publish_part_updated(session_id, json!(part));
+        }
+    }
+
     fn publish_part_updated(&self, session_id: &str, part: Value) {
         self.publish(json!({
             "type": "message.part.updated",
@@ -197,12 +231,18 @@ impl AppState {
         self.publish_session_status(session_id, status);
     }
 
-    fn forward_session_events(&self, session: &SessionInfo, rpc: Arc<PiRpcClient>) {
+    fn forward_session_events(
+        &self,
+        session: &SessionInfo,
+        rpc: Arc<PiRpcClient>,
+        record: Arc<Mutex<SessionRecord>>,
+    ) {
         let mut rx = rpc.subscribe();
         let tx = self.global_events.clone();
         let directory = self.config.directory.display().to_string();
         let project = self.project_id.clone();
         let session_id = session.id.clone();
+        let state = self.clone();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -219,6 +259,9 @@ impl AppState {
                                 }
                             }
                         }));
+                        state
+                            .publish_translated_pi_event(&session_id, &record, &payload)
+                            .await;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -226,6 +269,533 @@ impl AppState {
             }
         });
     }
+
+    async fn publish_translated_pi_event(
+        &self,
+        session_id: &str,
+        record: &Arc<Mutex<SessionRecord>>,
+        payload: &Value,
+    ) {
+        let event_type = payload.get("type").and_then(Value::as_str);
+        let mut record = record.lock().await;
+        if record.live.assistant.is_none() {
+            return;
+        }
+
+        match event_type {
+            Some("message_start") if is_assistant_message_event(payload) => {
+                self.ensure_live_assistant_message(&mut record);
+            }
+            Some("message_update") => {
+                self.ensure_live_assistant_message(&mut record);
+                if let Some(event) = payload.get("assistantMessageEvent") {
+                    self.publish_assistant_message_event(session_id, &mut record, event);
+                }
+            }
+            Some("tool_execution_start") => {
+                self.ensure_live_assistant_message(&mut record);
+                self.publish_tool_execution_start(session_id, &mut record, payload);
+            }
+            Some("tool_execution_update") => {
+                self.ensure_live_assistant_message(&mut record);
+                self.publish_tool_execution_update(session_id, &mut record, payload);
+            }
+            Some("tool_execution_end") => {
+                self.ensure_live_assistant_message(&mut record);
+                self.publish_tool_execution_end(session_id, &mut record, payload);
+            }
+            _ => {}
+        }
+    }
+
+    fn ensure_live_assistant_message(&self, record: &mut SessionRecord) {
+        let Some(live) = record.live.assistant.as_mut() else {
+            return;
+        };
+        if live.published_message {
+            return;
+        }
+        live.published_message = true;
+        let info = assistant_message_pending_with_id(
+            &record.info,
+            &live.parent_id,
+            live.message_id.clone(),
+            &live.directory,
+        );
+        self.publish(json!({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": record.info.id.clone(),
+                "info": info,
+            },
+        }));
+    }
+
+    fn publish_assistant_message_event(
+        &self,
+        session_id: &str,
+        record: &mut SessionRecord,
+        event: &Value,
+    ) {
+        let kind = event.get("type").and_then(Value::as_str);
+        match kind {
+            Some("text_start") => {
+                self.publish_live_text_start(session_id, record, LiveTextKind::Text, event);
+            }
+            Some("text_delta") => {
+                self.publish_live_text_delta(session_id, record, LiveTextKind::Text, event);
+            }
+            Some("text_end") => {
+                self.publish_live_text_end(session_id, record, LiveTextKind::Text, event);
+            }
+            Some("thinking_start") => {
+                self.publish_live_text_start(session_id, record, LiveTextKind::Reasoning, event);
+            }
+            Some("thinking_delta") => {
+                self.publish_live_text_delta(session_id, record, LiveTextKind::Reasoning, event);
+            }
+            Some("thinking_end") => {
+                self.publish_live_text_end(session_id, record, LiveTextKind::Reasoning, event);
+            }
+            Some("toolcall_end") => {
+                self.publish_tool_call_pending(session_id, record, event);
+            }
+            _ => {}
+        }
+    }
+
+    fn publish_live_text_start(
+        &self,
+        session_id: &str,
+        record: &mut SessionRecord,
+        kind: LiveTextKind,
+        event: &Value,
+    ) {
+        let key = content_key(event);
+        let Some(part) = ensure_live_text_part(record, kind, &key) else {
+            return;
+        };
+        self.publish_part_updated(session_id, part);
+    }
+
+    fn publish_live_text_delta(
+        &self,
+        session_id: &str,
+        record: &mut SessionRecord,
+        kind: LiveTextKind,
+        event: &Value,
+    ) {
+        let key = content_key(event);
+        let delta = event
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let Some((part_id, message_id, maybe_started)) =
+            append_live_text_delta(record, kind, &key, &delta)
+        else {
+            return;
+        };
+        if let Some(started) = maybe_started {
+            self.publish_part_updated(session_id, started);
+        }
+        self.publish(json!({
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": session_id,
+                "messageID": message_id,
+                "partID": part_id,
+                "field": "text",
+                "delta": delta,
+            },
+        }));
+    }
+
+    fn publish_live_text_end(
+        &self,
+        session_id: &str,
+        record: &mut SessionRecord,
+        kind: LiveTextKind,
+        event: &Value,
+    ) {
+        let key = content_key(event);
+        let content = event
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(part) = finish_live_text_part(record, kind, &key, content) else {
+            return;
+        };
+        self.publish_part_updated(session_id, part);
+    }
+
+    fn publish_tool_call_pending(
+        &self,
+        session_id: &str,
+        record: &mut SessionRecord,
+        event: &Value,
+    ) {
+        let Some(tool_call) = event.get("toolCall") else {
+            return;
+        };
+        let Some(call_id) = tool_call.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let tool = tool_call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let input = tool_call
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let state = json!({
+            "status": "pending",
+            "input": object_or_empty(input.clone()),
+            "raw": input.to_string(),
+        });
+        if let Some(part) = upsert_live_tool_part(record, call_id, tool, state) {
+            self.publish_part_updated(session_id, part);
+        }
+    }
+
+    fn publish_tool_execution_start(
+        &self,
+        session_id: &str,
+        record: &mut SessionRecord,
+        payload: &Value,
+    ) {
+        let Some(call_id) = payload.get("toolCallId").and_then(Value::as_str) else {
+            return;
+        };
+        let tool = payload
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let input = object_or_empty(payload.get("args").cloned().unwrap_or_else(|| json!({})));
+        let state = json!({
+            "status": "running",
+            "input": input,
+            "title": tool_title(tool, payload.get("args")),
+            "time": { "start": now_ms() },
+        });
+        if let Some(part) = upsert_live_tool_part(record, call_id, tool, state) {
+            self.publish_part_updated(session_id, part);
+        }
+    }
+
+    fn publish_tool_execution_update(
+        &self,
+        session_id: &str,
+        record: &mut SessionRecord,
+        payload: &Value,
+    ) {
+        let Some(call_id) = payload.get("toolCallId").and_then(Value::as_str) else {
+            return;
+        };
+        let tool = payload
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let input = object_or_empty(payload.get("args").cloned().unwrap_or_else(|| json!({})));
+        let output = payload
+            .get("partialResult")
+            .map(extract_tool_output)
+            .unwrap_or_default();
+        let state = json!({
+            "status": "running",
+            "input": input,
+            "title": tool_title(tool, payload.get("args")),
+            "metadata": { "partialOutput": output },
+            "time": { "start": live_tool_start(record, call_id).unwrap_or_else(now_ms) },
+        });
+        if let Some(part) = upsert_live_tool_part(record, call_id, tool, state) {
+            self.publish_part_updated(session_id, part);
+        }
+    }
+
+    fn publish_tool_execution_end(
+        &self,
+        session_id: &str,
+        record: &mut SessionRecord,
+        payload: &Value,
+    ) {
+        let Some(call_id) = payload.get("toolCallId").and_then(Value::as_str) else {
+            return;
+        };
+        let tool = payload
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let input = object_or_empty(payload.get("args").cloned().unwrap_or_else(|| json!({})));
+        let output = payload
+            .get("result")
+            .map(extract_tool_output)
+            .unwrap_or_default();
+        let is_error = payload
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || payload
+                .get("result")
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let start = live_tool_start(record, call_id).unwrap_or_else(now_ms);
+        let state = if is_error {
+            json!({
+                "status": "error",
+                "input": input,
+                "error": output,
+                "metadata": {},
+                "time": { "start": start, "end": now_ms() },
+            })
+        } else {
+            json!({
+                "status": "completed",
+                "input": input,
+                "output": output,
+                "title": tool_title(tool, payload.get("args")),
+                "metadata": {},
+                "time": { "start": start, "end": now_ms() },
+            })
+        };
+        if let Some(part) = upsert_live_tool_part(record, call_id, tool, state) {
+            self.publish_part_updated(session_id, part);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LiveTextKind {
+    Text,
+    Reasoning,
+}
+
+fn start_live_assistant(record: &mut SessionRecord, parent_id: &str, directory: PathBuf) -> String {
+    let message_id = ids::message_id_after(parent_id);
+    record.live.assistant = Some(LiveAssistant {
+        message_id: message_id.clone(),
+        parent_id: parent_id.to_string(),
+        directory,
+        published_message: false,
+        parts: Vec::new(),
+        text_parts: HashMap::new(),
+        reasoning_parts: HashMap::new(),
+        tool_parts: HashMap::new(),
+    });
+    message_id
+}
+
+fn is_assistant_message_event(payload: &Value) -> bool {
+    payload
+        .get("message")
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant")
+}
+
+fn content_key(event: &Value) -> String {
+    event
+        .get("contentIndex")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "0".to_string(), |index| index.to_string())
+}
+
+fn ensure_live_text_part(
+    record: &mut SessionRecord,
+    kind: LiveTextKind,
+    key: &str,
+) -> Option<Value> {
+    let (index, _) = ensure_live_text_part_index(record, kind, key)?;
+    record
+        .live
+        .assistant
+        .as_ref()
+        .map(|live| json!(live.parts[index].clone()))
+}
+
+fn append_live_text_delta(
+    record: &mut SessionRecord,
+    kind: LiveTextKind,
+    key: &str,
+    delta: &str,
+) -> Option<(String, String, Option<Value>)> {
+    let (index, created) = ensure_live_text_part_index(record, kind, key)?;
+    let live = record.live.assistant.as_mut()?;
+    let started = created.then(|| json!(live.parts[index].clone()));
+    let text = text_part_mut(&mut live.parts[index])?;
+    text.text.push_str(delta);
+    Some((text.id.clone(), text.message_id.clone(), started))
+}
+
+fn finish_live_text_part(
+    record: &mut SessionRecord,
+    kind: LiveTextKind,
+    key: &str,
+    content: &str,
+) -> Option<Value> {
+    let (index, _) = ensure_live_text_part_index(record, kind, key)?;
+    let live = record.live.assistant.as_mut()?;
+    let text = text_part_mut(&mut live.parts[index])?;
+    text.text = content.to_string();
+    let now = now_ms();
+    match text.time.as_mut() {
+        Some(time) => time.end = Some(now),
+        None => {
+            text.time = Some(PartTime {
+                start: now,
+                end: Some(now),
+            });
+        }
+    }
+    Some(json!(live.parts[index].clone()))
+}
+
+fn ensure_live_text_part_index(
+    record: &mut SessionRecord,
+    kind: LiveTextKind,
+    key: &str,
+) -> Option<(usize, bool)> {
+    let live = record.live.assistant.as_mut()?;
+    let existing = match kind {
+        LiveTextKind::Text => live.text_parts.get(key).copied(),
+        LiveTextKind::Reasoning => live.reasoning_parts.get(key).copied(),
+    };
+    if let Some(index) = existing {
+        return Some((index, false));
+    }
+
+    let now = now_ms();
+    let part = TextPart {
+        id: ids::part_id(),
+        session_id: record.info.id.clone(),
+        message_id: live.message_id.clone(),
+        text: String::new(),
+        time: Some(PartTime {
+            start: now,
+            end: None,
+        }),
+        metadata: None,
+    };
+    let part = match kind {
+        LiveTextKind::Text => Part::Text(part),
+        LiveTextKind::Reasoning => Part::Reasoning(part),
+    };
+    live.parts.push(part);
+    let index = live.parts.len() - 1;
+    match kind {
+        LiveTextKind::Text => live.text_parts.insert(key.to_string(), index),
+        LiveTextKind::Reasoning => live.reasoning_parts.insert(key.to_string(), index),
+    };
+    Some((index, true))
+}
+
+fn text_part_mut(part: &mut Part) -> Option<&mut TextPart> {
+    match part {
+        Part::Text(text) | Part::Reasoning(text) => Some(text),
+        Part::File(_) | Part::Tool(_) => None,
+    }
+}
+
+fn upsert_live_tool_part(
+    record: &mut SessionRecord,
+    call_id: &str,
+    tool: &str,
+    state: Value,
+) -> Option<Value> {
+    let live = record.live.assistant.as_mut()?;
+    if let Some(index) = live.tool_parts.get(call_id).copied() {
+        if let Part::Tool(part) = &mut live.parts[index] {
+            part.tool = tool.to_string();
+            part.state = state;
+        }
+        return Some(json!(live.parts[index].clone()));
+    }
+
+    let part = Part::Tool(ToolPart {
+        id: ids::part_id(),
+        session_id: record.info.id.clone(),
+        message_id: live.message_id.clone(),
+        call_id: call_id.to_string(),
+        tool: tool.to_string(),
+        state,
+    });
+    live.parts.push(part);
+    let index = live.parts.len() - 1;
+    live.tool_parts.insert(call_id.to_string(), index);
+    Some(json!(live.parts[index].clone()))
+}
+
+fn live_tool_start(record: &SessionRecord, call_id: &str) -> Option<i64> {
+    let live = record.live.assistant.as_ref()?;
+    let index = live.tool_parts.get(call_id)?;
+    let Part::Tool(part) = live.parts.get(*index)? else {
+        return None;
+    };
+    part.state
+        .get("time")
+        .and_then(|time| time.get("start"))
+        .and_then(Value::as_i64)
+}
+
+fn object_or_empty(value: Value) -> Value {
+    if value.is_object() {
+        value
+    } else if value.is_null() {
+        json!({})
+    } else {
+        json!({ "value": value })
+    }
+}
+
+fn tool_title(tool: &str, args: Option<&Value>) -> String {
+    let Some(args) = args.and_then(Value::as_object) else {
+        return tool.to_string();
+    };
+    let Some((key, value)) = args.iter().next() else {
+        return tool.to_string();
+    };
+    let value = value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string());
+    if value.len() > 80 {
+        let truncated = value.chars().take(80).collect::<String>();
+        format!("{tool} {key}={truncated}")
+    } else {
+        format!("{tool} {key}={value}")
+    }
+}
+
+fn extract_tool_output(value: &Value) -> String {
+    value
+        .get("content")
+        .map(extract_content_text)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn assistant_has_text_part(message: &MessageWithParts) -> bool {
+    message
+        .parts
+        .iter()
+        .any(|part| matches!(part, Part::Text(text) if !text.text.is_empty()))
+}
+
+fn completed_text_part_with_id(session_id: &str, message_id: &str, text: String) -> Part {
+    let now = now_ms();
+    Part::Text(TextPart {
+        id: ids::part_id(),
+        session_id: session_id.to_string(),
+        message_id: message_id.to_string(),
+        text,
+        time: Some(PartTime {
+            start: now,
+            end: Some(now),
+        }),
+        metadata: None,
+    })
 }
 
 struct TextDelta {
@@ -734,14 +1304,15 @@ async fn prompt_session_async(
         return Err(Error::bad_request("prompt parts must include text"));
     }
     let record = state.get_session(&session_id).await?;
-    let (rpc, user, directory) = {
+    let (rpc, user, directory, assistant_id) = {
         let mut record = record.lock().await;
         let user = user_message(&record.info, &payload, text.clone());
         let directory = PathBuf::from(record.info.directory.clone());
+        let assistant_id = start_live_assistant(&mut record, user.info.id(), directory.clone());
         record.messages.push(user.clone());
         record.info.touch();
         state.publish_message(&user);
-        (Arc::clone(&record.rpc), user, directory)
+        (Arc::clone(&record.rpc), user, directory, assistant_id)
     };
 
     state
@@ -755,6 +1326,7 @@ async fn prompt_session_async(
                     state.clone(),
                     session_id.clone(),
                     user.info.id().to_string(),
+                    assistant_id,
                     directory,
                     event,
                 )
@@ -765,6 +1337,9 @@ async fn prompt_session_async(
             }
             Err(err) => {
                 tracing::warn!(%err, "background pi prompt failed");
+                if let Ok(record) = state.get_session(&session_id).await {
+                    record.lock().await.live.assistant = None;
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -788,17 +1363,19 @@ async fn prompt_impl(
     }
 
     let record = state.get_session(&session_id).await?;
-    let (rpc, user, directory) = {
+    let (rpc, user, directory, assistant_id) = {
         let mut record = record.lock().await;
         let user = user_message(&record.info, &payload, text.clone());
         let directory = PathBuf::from(record.info.directory.clone());
+        let assistant_id = start_live_assistant(&mut record, user.info.id(), directory.clone());
         record.messages.push(user.clone());
         record.info.touch();
         state.publish_message(&user);
-        (Arc::clone(&record.rpc), user, directory)
+        (Arc::clone(&record.rpc), user, directory, assistant_id)
     };
 
     if payload.no_reply {
+        record.lock().await.live.assistant = None;
         return Ok(user);
     }
 
@@ -808,6 +1385,7 @@ async fn prompt_impl(
     let event = match rpc.prompt(&text).await {
         Ok(event) => event,
         Err(err) => {
+            record.lock().await.live.assistant = None;
             state
                 .set_session_status(&session_id, json!({ "type": "idle" }))
                 .await;
@@ -818,6 +1396,7 @@ async fn prompt_impl(
         state.clone(),
         session_id.clone(),
         user.info.id().to_string(),
+        assistant_id,
         directory,
         event,
     )
@@ -833,13 +1412,46 @@ async fn record_assistant_from_event(
     state: AppState,
     session_id: String,
     parent_id: String,
+    assistant_id: String,
     directory: PathBuf,
     event: Value,
 ) -> Result<MessageWithParts> {
     let record = state.get_session(&session_id).await?;
     let mut record = record.lock().await;
-    let assistant = assistant_from_agent_end(&record.info, &parent_id, &directory, &event)
-        .unwrap_or_else(|| assistant_message(&record.info, &parent_id, "", &directory));
+    let mut assistant =
+        assistant_from_agent_end(&record.info, &parent_id, &assistant_id, &directory, &event)
+            .unwrap_or_else(|| {
+                assistant_message_with_id(
+                    &record.info,
+                    &parent_id,
+                    assistant_id.clone(),
+                    "",
+                    &directory,
+                )
+            });
+    let live = record.live.assistant.take();
+    if let Some(live) = live.filter(|live| live.message_id == assistant_id) {
+        let final_text = assistant
+            .parts
+            .iter()
+            .find_map(|part| match part {
+                Part::Text(text) => Some(text.text.clone()),
+                Part::Reasoning(_) | Part::File(_) | Part::Tool(_) => None,
+            })
+            .unwrap_or_default();
+        assistant.parts = live.parts;
+        if !final_text.is_empty() && !assistant_has_text_part(&assistant) {
+            assistant.parts.push(completed_text_part_with_id(
+                &record.info.id,
+                &assistant_id,
+                final_text,
+            ));
+        }
+        record.messages.push(assistant.clone());
+        record.info.touch();
+        state.publish_message_snapshot(&assistant);
+        return Ok(assistant);
+    }
     record.messages.push(assistant.clone());
     record.info.touch();
     state.publish_message(&assistant);
@@ -1373,13 +1985,20 @@ fn parse_optional_value(body: &Bytes) -> Result<Option<Value>> {
 fn assistant_from_agent_end(
     session: &SessionInfo,
     parent_id: &str,
+    assistant_id: &str,
     cwd: &Path,
     event: &Value,
 ) -> Option<MessageWithParts> {
     if let Some(error) = event.get("error").and_then(Value::as_str)
         && !error.is_empty()
     {
-        return Some(assistant_message(session, parent_id, error, cwd));
+        return Some(assistant_message_with_id(
+            session,
+            parent_id,
+            assistant_id.to_string(),
+            error,
+            cwd,
+        ));
     }
 
     let messages = event.get("messages").and_then(Value::as_array)?;
@@ -1388,7 +2007,13 @@ fn assistant_from_agent_end(
             || message.get("type").and_then(Value::as_str) == Some("assistant")
     })?;
     let text = extract_text(assistant);
-    Some(assistant_message(session, parent_id, text, cwd))
+    Some(assistant_message_with_id(
+        session,
+        parent_id,
+        assistant_id.to_string(),
+        text,
+        cwd,
+    ))
 }
 
 fn extract_text(value: &Value) -> String {

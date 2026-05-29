@@ -465,6 +465,96 @@ async fn assistant_events_sort_after_tui_supplied_user_message_ids() {
 }
 
 #[tokio::test]
+async fn pi_rpc_semantic_stream_is_translated_to_native_opencode_parts() {
+    let harness = Harness::new();
+    let state = AppState::new(harness.config());
+    let mut events = state.subscribe_events();
+    let app = app_with_state(state);
+
+    let session = create_session(app.clone()).await;
+    let session_id = session["id"].as_str().expect("session id");
+    let _created_event = next_event(&mut events, "session.updated").await;
+
+    let assistant = prompt(app.clone(), session_id, "stream events").await;
+    assert_eq!(assistant["info"]["role"], "assistant");
+
+    let mut saw_reasoning_update = false;
+    let mut saw_reasoning_delta = false;
+    let mut saw_tool_running = false;
+    let mut saw_tool_completed = false;
+    let mut saw_text_delta = false;
+
+    timeout(Duration::from_secs(2), async {
+        while !(saw_reasoning_update
+            && saw_reasoning_delta
+            && saw_tool_running
+            && saw_tool_completed
+            && saw_text_delta)
+        {
+            let event = events.recv().await.expect("event");
+            let payload = &event["payload"];
+            if payload["properties"]["sessionID"] != session_id {
+                continue;
+            }
+            match payload["type"].as_str() {
+                Some("message.part.updated") => {
+                    let part = &payload["properties"]["part"];
+                    match part["type"].as_str() {
+                        Some("reasoning") => {
+                            saw_reasoning_update = true;
+                        }
+                        Some("tool") => match part["state"]["status"].as_str() {
+                            Some("running") => {
+                                assert_eq!(part["tool"], "bash");
+                                assert_eq!(part["state"]["input"]["cmd"], "printf hi");
+                                saw_tool_running = true;
+                            }
+                            Some("completed") => {
+                                assert_eq!(part["state"]["output"], "hi");
+                                saw_tool_completed = true;
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+                Some("message.part.delta") => {
+                    if payload["properties"]["field"] == "text" {
+                        match payload["properties"]["delta"].as_str() {
+                            Some("thinking") => saw_reasoning_delta = true,
+                            Some("streamed answer") => saw_text_delta = true,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("translated stream events");
+
+    let messages = get_json(app, &format!("/session/{session_id}/message")).await;
+    let assistant = &messages.as_array().expect("messages")[1];
+    assert!(
+        assistant["parts"]
+            .as_array()
+            .expect("assistant parts")
+            .iter()
+            .any(|part| part["type"] == "reasoning" && part["text"] == "thinking")
+    );
+    assert!(
+        assistant["parts"]
+            .as_array()
+            .expect("assistant parts")
+            .iter()
+            .any(|part| part["type"] == "tool"
+                && part["tool"] == "bash"
+                && part["state"]["status"] == "completed")
+    );
+}
+
+#[tokio::test]
 async fn event_routes_match_opencode_instance_and_global_shapes() {
     let harness = Harness::new();
     let (base_url, server) = spawn_test_server(app(harness.config())).await;
@@ -935,6 +1025,100 @@ for line in sys.stdin:
     if command == "prompt":
         message = request.get("message", "")
         print(json.dumps({"type": "response", "id": request_id, "command": "prompt", "success": True}), flush=True)
+        if message == "stream events":
+            assistant = {
+                "role": "assistant",
+                "content": [],
+                "api": "test",
+                "provider": "test",
+                "model": "test",
+                "usage": {},
+                "stopReason": "stop",
+                "timestamp": 0
+            }
+            print(json.dumps({"type": "message_start", "message": assistant}), flush=True)
+            print(json.dumps({
+                "type": "message_update",
+                "message": assistant,
+                "assistantMessageEvent": {
+                    "type": "thinking_start",
+                    "contentIndex": 0,
+                    "partial": {**assistant, "content": [{"type": "thinking", "thinking": ""}]}
+                }
+            }), flush=True)
+            print(json.dumps({
+                "type": "message_update",
+                "message": assistant,
+                "assistantMessageEvent": {
+                    "type": "thinking_delta",
+                    "contentIndex": 0,
+                    "delta": "thinking",
+                    "partial": {**assistant, "content": [{"type": "thinking", "thinking": "thinking"}]}
+                }
+            }), flush=True)
+            print(json.dumps({
+                "type": "message_update",
+                "message": assistant,
+                "assistantMessageEvent": {
+                    "type": "thinking_end",
+                    "contentIndex": 0,
+                    "content": "thinking",
+                    "partial": {**assistant, "content": [{"type": "thinking", "thinking": "thinking"}]}
+                }
+            }), flush=True)
+            print(json.dumps({
+                "type": "message_update",
+                "message": assistant,
+                "assistantMessageEvent": {
+                    "type": "toolcall_end",
+                    "contentIndex": 1,
+                    "toolCall": {"id": "tool-1", "name": "bash", "arguments": {"cmd": "printf hi"}},
+                    "partial": assistant
+                }
+            }), flush=True)
+            print(json.dumps({"type": "tool_execution_start", "toolCallId": "tool-1", "toolName": "bash", "args": {"cmd": "printf hi"}}), flush=True)
+            print(json.dumps({
+                "type": "tool_execution_end",
+                "toolCallId": "tool-1",
+                "toolName": "bash",
+                "isError": False,
+                "result": {"content": [{"type": "text", "text": "hi"}], "details": None, "isError": False}
+            }), flush=True)
+            print(json.dumps({
+                "type": "message_update",
+                "message": assistant,
+                "assistantMessageEvent": {
+                    "type": "text_start",
+                    "contentIndex": 2,
+                    "partial": assistant
+                }
+            }), flush=True)
+            print(json.dumps({
+                "type": "message_update",
+                "message": assistant,
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "contentIndex": 2,
+                    "delta": "streamed answer",
+                    "partial": {**assistant, "content": [{"type": "text", "text": "streamed answer"}]}
+                }
+            }), flush=True)
+            print(json.dumps({
+                "type": "message_update",
+                "message": assistant,
+                "assistantMessageEvent": {
+                    "type": "text_end",
+                    "contentIndex": 2,
+                    "content": "streamed answer",
+                    "partial": {**assistant, "content": [{"type": "text", "text": "streamed answer"}]}
+                }
+            }), flush=True)
+            print(json.dumps({
+                "type": "agent_end",
+                "messages": [{**assistant, "content": [{"type": "text", "text": "streamed answer"}]}],
+                "error": None
+            }), flush=True)
+            continue
         print(json.dumps({
             "type": "agent_end",
             "messages": [{

@@ -413,7 +413,22 @@ pub fn assistant_message(
     text: impl Into<String>,
     cwd: &Path,
 ) -> MessageWithParts {
-    let id = ids::message_id_after(parent_id);
+    assistant_message_with_id(
+        session,
+        parent_id,
+        ids::message_id_after(parent_id),
+        text,
+        cwd,
+    )
+}
+
+pub fn assistant_message_with_id(
+    session: &SessionInfo,
+    parent_id: &str,
+    id: String,
+    text: impl Into<String>,
+    cwd: &Path,
+) -> MessageWithParts {
     let now = now_ms();
     let model = session.model.clone().unwrap_or_default();
     MessageWithParts {
@@ -440,6 +455,37 @@ pub fn assistant_message(
         }),
         parts: vec![completed_text_part(&session.id, &id, text)],
     }
+}
+
+pub fn assistant_message_pending_with_id(
+    session: &SessionInfo,
+    parent_id: &str,
+    id: String,
+    cwd: &Path,
+) -> MessageInfo {
+    let now = now_ms();
+    let model = session.model.clone().unwrap_or_default();
+    MessageInfo::Assistant(AssistantMessageInfo {
+        id,
+        session_id: session.id.clone(),
+        time: CompletedTime {
+            created: now,
+            completed: None,
+        },
+        parent_id: parent_id.to_string(),
+        model_id: model.model_id,
+        provider_id: model.provider_id,
+        mode: session.agent.clone().unwrap_or_else(|| "build".to_string()),
+        agent: session.agent.clone().unwrap_or_else(|| "build".to_string()),
+        path: MessagePath {
+            cwd: cwd.display().to_string(),
+            root: cwd.display().to_string(),
+        },
+        cost: 0.0,
+        tokens: Tokens::default(),
+        finish: None,
+        error: None,
+    })
 }
 
 pub fn path_to_string(path: PathBuf) -> String {
