@@ -30,7 +30,7 @@ impl PiRpcClient {
     pub async fn spawn(pi_bin: &Path, directory: &Path) -> Result<Arc<Self>> {
         let mut command = Command::new(pi_bin);
         command
-            .arg("--rpc")
+            .args(["--mode", "rpc"])
             .current_dir(directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -38,7 +38,10 @@ impl PiRpcClient {
             .kill_on_drop(true);
 
         let mut child = command.spawn().map_err(|err| {
-            Error::Process(format!("failed to spawn {} --rpc: {err}", pi_bin.display()))
+            Error::Process(format!(
+                "failed to spawn {} --mode rpc: {err}",
+                pi_bin.display()
+            ))
         })?;
 
         let stdin = child

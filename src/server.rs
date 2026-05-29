@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,8 +17,6 @@ use ignore::WalkBuilder;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -26,8 +25,8 @@ use crate::config::ServerConfig;
 use crate::error::{Error, Result};
 use crate::ids;
 use crate::models::{
-    CreateSessionPayload, FileNode, MessageWithParts, PromptPayload, SessionInfo,
-    assistant_message, now_ms, path_to_string, user_message,
+    CreateSessionPayload, FileNode, MessageInfo, MessageWithParts, Part, PromptPayload,
+    SessionInfo, assistant_message, now_ms, path_to_string, user_message,
 };
 use crate::opencode_routes::OPENCODE_ROUTES;
 use crate::pi_rpc::PiRpcClient;
@@ -35,7 +34,9 @@ use crate::pi_rpc::PiRpcClient;
 #[derive(Debug, Clone)]
 pub struct AppState {
     config: ServerConfig,
+    project_id: String,
     sessions: Arc<RwLock<HashMap<String, Arc<Mutex<SessionRecord>>>>>,
+    statuses: Arc<RwLock<HashMap<String, Value>>>,
     global_events: broadcast::Sender<Value>,
 }
 
@@ -46,14 +47,26 @@ struct SessionRecord {
     messages: Vec<MessageWithParts>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum EventStreamShape {
+    Instance,
+    Global,
+}
+
 impl AppState {
     pub fn new(config: ServerConfig) -> Self {
         let (global_events, _) = broadcast::channel(4096);
         Self {
             config,
+            project_id: ids::project_id(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            statuses: Arc::new(RwLock::new(HashMap::new())),
             global_events,
         }
+    }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Value> {
+        self.global_events.subscribe()
     }
 
     async fn get_session(&self, session_id: &str) -> Result<Arc<Mutex<SessionRecord>>> {
@@ -70,6 +83,7 @@ impl AppState {
             &self.config.directory,
             payload.as_ref().and_then(|p| p.title.clone()),
         );
+        info.project_id = self.project_id.clone();
         if let Some(payload) = payload {
             info.parent_id = payload.parent_id;
             info.agent = payload.agent.or(info.agent);
@@ -89,31 +103,114 @@ impl AppState {
             .await
             .insert(info.id.clone(), Arc::clone(&record));
         self.forward_session_events(&info, rpc);
-        self.publish(json!({
-            "type": "session.created",
-            "properties": { "info": info.clone() },
-        }));
+        self.publish_session_updated(&info);
         Ok(info)
     }
 
     fn publish(&self, payload: Value) {
         let _ = self.global_events.send(json!({
             "directory": self.config.directory.display().to_string(),
+            "project": self.project_id.clone(),
+            "workspace": null,
             "payload": payload,
         }));
+    }
+
+    fn publish_session_updated(&self, info: &SessionInfo) {
+        self.publish(json!({
+            "type": "session.updated",
+            "properties": {
+                "sessionID": info.id,
+                "info": info,
+            },
+        }));
+    }
+
+    fn publish_session_deleted(&self, info: &SessionInfo) {
+        self.publish(json!({
+            "type": "session.deleted",
+            "properties": {
+                "sessionID": info.id,
+                "info": info,
+            },
+        }));
+    }
+
+    fn publish_message(&self, message: &MessageWithParts) {
+        let session_id = message.info.session_id();
+        let assistant = matches!(&message.info, MessageInfo::Assistant(_));
+        self.publish(json!({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": session_id,
+                "info": &message.info,
+            },
+        }));
+        for part in &message.parts {
+            if assistant && let Some(delta) = text_delta(part) {
+                self.publish_part_updated(session_id, started_part(part));
+                self.publish(json!({
+                    "type": "message.part.delta",
+                    "properties": {
+                        "sessionID": session_id,
+                        "messageID": delta.message_id,
+                        "partID": delta.part_id,
+                        "field": "text",
+                        "delta": delta.text,
+                    },
+                }));
+            }
+            self.publish_part_updated(session_id, json!(part));
+        }
+    }
+
+    fn publish_part_updated(&self, session_id: &str, part: Value) {
+        self.publish(json!({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": session_id,
+                "part": part,
+                "time": now_ms(),
+            },
+        }));
+    }
+
+    fn publish_session_status(&self, session_id: &str, status: Value) {
+        self.publish(json!({
+            "type": "session.status",
+            "properties": {
+                "sessionID": session_id,
+                "status": status,
+            },
+        }));
+    }
+
+    async fn set_session_status(&self, session_id: &str, status: Value) {
+        if status.get("type").and_then(Value::as_str) == Some("idle") {
+            self.statuses.write().await.remove(session_id);
+        } else {
+            self.statuses
+                .write()
+                .await
+                .insert(session_id.to_string(), status.clone());
+        }
+        self.publish_session_status(session_id, status);
     }
 
     fn forward_session_events(&self, session: &SessionInfo, rpc: Arc<PiRpcClient>) {
         let mut rx = rpc.subscribe();
         let tx = self.global_events.clone();
         let directory = self.config.directory.display().to_string();
+        let project = self.project_id.clone();
         let session_id = session.id.clone();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(payload) => {
                         let _ = tx.send(json!({
-                            "directory": directory,
+                            "directory": directory.clone(),
+                            "project": project.clone(),
+                            "workspace": null,
                             "payload": {
                                 "type": "pi.rpc.event",
                                 "properties": {
@@ -131,6 +228,41 @@ impl AppState {
     }
 }
 
+struct TextDelta {
+    part_id: String,
+    message_id: String,
+    text: String,
+}
+
+fn text_delta(part: &Part) -> Option<TextDelta> {
+    let text = match part {
+        Part::Text(text) | Part::Reasoning(text) => text,
+        Part::File(_) | Part::Tool(_) => return None,
+    };
+
+    if text.text.is_empty() || text.time.as_ref().and_then(|time| time.end).is_none() {
+        return None;
+    }
+
+    Some(TextDelta {
+        part_id: text.id.clone(),
+        message_id: text.message_id.clone(),
+        text: text.text.clone(),
+    })
+}
+
+fn started_part(part: &Part) -> Value {
+    let mut value = json!(part);
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    object.insert("text".to_string(), Value::String(String::new()));
+    if let Some(time) = object.get_mut("time").and_then(Value::as_object_mut) {
+        time.remove("end");
+    }
+    value
+}
+
 pub fn app(config: ServerConfig) -> Router {
     app_with_state(AppState::new(config))
 }
@@ -140,7 +272,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/doc", get(doc))
         .route("/global/health", get(global_health))
         .route("/global/event", get(global_event))
-        .route("/event", get(global_event))
+        .route("/event", get(instance_event))
         .route(
             "/global/config",
             get(empty_object).patch(echo_or_empty_object),
@@ -166,7 +298,7 @@ pub fn app_with_state(state: AppState) -> Router {
                 .patch(update_session)
                 .delete(remove_session),
         )
-        .route("/session/:session_id/children", get(empty_array))
+        .route("/session/:session_id/children", get(session_children))
         .route("/session/:session_id/todo", get(empty_array))
         .route("/session/:session_id/diff", get(empty_array))
         .route(
@@ -338,17 +470,70 @@ async fn global_health() -> Json<Value> {
 
 async fn global_event(
     State(state): State<AppState>,
-) -> Sse<impl Stream<Item = std::result::Result<Event, std::convert::Infallible>>> {
-    let stream =
-        BroadcastStream::new(state.global_events.subscribe()).filter_map(|item| match item {
-            Ok(value) => Some(Ok(Event::default().data(value.to_string()))),
-            Err(_) => None,
-        });
-    Sse::new(stream).keep_alive(
+) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    Sse::new(event_stream(state, EventStreamShape::Global)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     )
+}
+
+async fn instance_event(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    Sse::new(event_stream(state, EventStreamShape::Instance)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+fn event_stream(
+    state: AppState,
+    shape: EventStreamShape,
+) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
+    let connected = match shape {
+        EventStreamShape::Instance => json!({
+            "type": "server.connected",
+            "properties": {},
+        }),
+        EventStreamShape::Global => json!({
+            "directory": state.config.directory.display().to_string(),
+            "project": state.project_id.clone(),
+            "workspace": null,
+            "payload": {
+                "type": "server.connected",
+                "properties": {},
+            },
+        }),
+    };
+
+    async_stream::stream! {
+        yield Ok(Event::default().data(connected.to_string()));
+
+        let mut rx = state.global_events.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(value) => {
+                    let value = match shape {
+                        EventStreamShape::Instance => instance_event_payload(value),
+                        EventStreamShape::Global => value,
+                    };
+                    yield Ok(Event::default().data(value.to_string()));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+}
+
+fn instance_event_payload(value: Value) -> Value {
+    if let Some(payload) = value.get("payload") {
+        payload.clone()
+    } else {
+        value
+    }
 }
 
 async fn create_session(State(state): State<AppState>, body: Bytes) -> Result<Json<SessionInfo>> {
@@ -380,6 +565,23 @@ async fn experimental_sessions(State(state): State<AppState>) -> Json<Vec<Value>
             })
             .collect(),
     )
+}
+
+async fn session_children(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<Vec<SessionInfo>>> {
+    state.get_session(&session_id).await?;
+    let sessions = state.sessions.read().await;
+    let mut children = Vec::new();
+    for record in sessions.values() {
+        let record = record.lock().await;
+        if record.info.parent_id.as_deref() == Some(session_id.as_str()) {
+            children.push(record.info.clone());
+        }
+    }
+    children.sort_by(|a, b| b.time.updated.cmp(&a.time.updated));
+    Ok(Json(children))
 }
 
 async fn v2_sessions(State(state): State<AppState>) -> Json<Value> {
@@ -415,6 +617,7 @@ async fn update_session(
         record.info.time.archived = Some(archived);
     }
     record.info.touch();
+    state.publish_session_updated(&record.info);
     Ok(Json(record.info.clone()))
 }
 
@@ -428,19 +631,26 @@ async fn remove_session(
         .await
         .remove(&session_id)
         .ok_or_else(|| Error::not_found(format!("session not found: {session_id}")))?;
-    record.lock().await.rpc.shutdown().await;
-    state.publish(json!({
-        "type": "session.deleted",
-        "properties": { "sessionID": session_id },
-    }));
+    state.statuses.write().await.remove(&session_id);
+    let record = record.lock().await;
+    let info = record.info.clone();
+    record.rpc.shutdown().await;
+    state.publish_session_deleted(&info);
     Ok(Json(true))
 }
 
 async fn session_status(State(state): State<AppState>) -> Json<Value> {
     let sessions = state.sessions.read().await;
+    let statuses = state.statuses.read().await;
     let mut map = serde_json::Map::new();
     for id in sessions.keys() {
-        map.insert(id.clone(), json!({ "type": "idle" }));
+        map.insert(
+            id.clone(),
+            statuses
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "idle" })),
+        );
     }
     Json(Value::Object(map))
 }
@@ -520,15 +730,48 @@ async fn prompt_session_async(
 ) -> Result<StatusCode> {
     let payload = parse_prompt_payload(&body)?;
     let text = payload.text();
+    if text.trim().is_empty() {
+        return Err(Error::bad_request("prompt parts must include text"));
+    }
     let record = state.get_session(&session_id).await?;
-    let rpc = {
+    let (rpc, user, directory) = {
         let mut record = record.lock().await;
         let user = user_message(&record.info, &payload, text.clone());
-        record.messages.push(user);
+        let directory = PathBuf::from(record.info.directory.clone());
+        record.messages.push(user.clone());
         record.info.touch();
-        Arc::clone(&record.rpc)
+        state.publish_message(&user);
+        (Arc::clone(&record.rpc), user, directory)
     };
-    rpc.prompt_async(text).await?;
+
+    state
+        .set_session_status(&session_id, json!({ "type": "busy" }))
+        .await;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        match rpc.prompt(&text).await {
+            Ok(event) => {
+                if let Err(err) = record_assistant_from_event(
+                    state.clone(),
+                    session_id.clone(),
+                    user.info.id().to_string(),
+                    directory,
+                    event,
+                )
+                .await
+                {
+                    tracing::warn!(%err, "failed to record async prompt completion");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "background pi prompt failed");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state
+            .set_session_status(&session_id, json!({ "type": "idle" }))
+            .await;
+    });
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -551,10 +794,7 @@ async fn prompt_impl(
         let directory = PathBuf::from(record.info.directory.clone());
         record.messages.push(user.clone());
         record.info.touch();
-        state.publish(json!({
-            "type": "message.updated",
-            "properties": { "sessionID": session_id, "info": user.info.clone() },
-        }));
+        state.publish_message(&user);
         (Arc::clone(&record.rpc), user, directory)
     };
 
@@ -562,20 +802,47 @@ async fn prompt_impl(
         return Ok(user);
     }
 
-    let event = rpc.prompt(&text).await?;
-    let assistant = {
-        let mut record = record.lock().await;
-        let assistant = assistant_from_agent_end(&record.info, user.info.id(), &directory, &event)
-            .unwrap_or_else(|| assistant_message(&record.info, user.info.id(), "", &directory));
-        record.messages.push(assistant.clone());
-        record.info.touch();
-        state.publish(json!({
-            "type": "message.updated",
-            "properties": { "sessionID": session_id, "info": assistant.info.clone() },
-        }));
-        assistant
+    state
+        .set_session_status(&session_id, json!({ "type": "busy" }))
+        .await;
+    let event = match rpc.prompt(&text).await {
+        Ok(event) => event,
+        Err(err) => {
+            state
+                .set_session_status(&session_id, json!({ "type": "idle" }))
+                .await;
+            return Err(err);
+        }
     };
+    let assistant = record_assistant_from_event(
+        state.clone(),
+        session_id.clone(),
+        user.info.id().to_string(),
+        directory,
+        event,
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    state
+        .set_session_status(&session_id, json!({ "type": "idle" }))
+        .await;
+    Ok(assistant)
+}
 
+async fn record_assistant_from_event(
+    state: AppState,
+    session_id: String,
+    parent_id: String,
+    directory: PathBuf,
+    event: Value,
+) -> Result<MessageWithParts> {
+    let record = state.get_session(&session_id).await?;
+    let mut record = record.lock().await;
+    let assistant = assistant_from_agent_end(&record.info, &parent_id, &directory, &event)
+        .unwrap_or_else(|| assistant_message(&record.info, &parent_id, "", &directory));
+    record.messages.push(assistant.clone());
+    record.info.touch();
+    state.publish_message(&assistant);
     Ok(assistant)
 }
 
@@ -663,6 +930,8 @@ async fn share_session(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("localhost");
     record.info.share = Some(json!({ "url": format!("http://{host}/share/{}", record.info.id) }));
+    record.info.touch();
+    state.publish_session_updated(&record.info);
     Ok(Json(record.info.clone()))
 }
 
@@ -673,6 +942,8 @@ async fn unshare_session(
     let record = state.get_session(&session_id).await?;
     let mut record = record.lock().await;
     record.info.share = None;
+    record.info.touch();
+    state.publish_session_updated(&record.info);
     Ok(Json(record.info.clone()))
 }
 
@@ -821,7 +1092,7 @@ async fn file_content(
 
 async fn project_current(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
-        "id": ids::project_id(),
+        "id": state.project_id.clone(),
         "name": state.config.directory.file_name().and_then(|n| n.to_str()),
         "worktree": state.config.directory.display().to_string(),
     }))
@@ -1023,7 +1294,7 @@ async fn worktree_create(State(state): State<AppState>) -> Json<Value> {
 async fn workspace_create(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "id": ids::workspace_id(),
-        "projectID": ids::project_id(),
+        "projectID": state.project_id.clone(),
         "name": "local",
         "directory": state.config.directory.display().to_string(),
     }))

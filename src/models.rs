@@ -37,7 +37,9 @@ impl Default for Tokens {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRef {
+    #[serde(rename = "providerID", alias = "providerId")]
     pub provider_id: String,
+    #[serde(rename = "modelID", alias = "modelId")]
     pub model_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
@@ -68,12 +70,15 @@ pub struct SessionTime {
 pub struct SessionInfo {
     pub id: String,
     pub slug: String,
+    #[serde(rename = "projectID", alias = "projectId")]
     pub project_id: String,
+    #[serde(rename = "workspaceID", alias = "workspaceId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     pub directory: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(rename = "parentID", alias = "parentId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,12 +160,20 @@ impl MessageInfo {
             Self::Assistant(info) => &info.id,
         }
     }
+
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::User(info) => &info.session_id,
+            Self::Assistant(info) => &info.session_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserMessageInfo {
     pub id: String,
+    #[serde(rename = "sessionID", alias = "sessionId")]
     pub session_id: String,
     pub time: CreatedTime,
     pub agent: String,
@@ -175,10 +188,14 @@ pub struct UserMessageInfo {
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessageInfo {
     pub id: String,
+    #[serde(rename = "sessionID", alias = "sessionId")]
     pub session_id: String,
     pub time: CompletedTime,
+    #[serde(rename = "parentID", alias = "parentId")]
     pub parent_id: String,
+    #[serde(rename = "modelID", alias = "modelId")]
     pub model_id: String,
+    #[serde(rename = "providerID", alias = "providerId")]
     pub provider_id: String,
     pub mode: String,
     pub agent: String,
@@ -226,20 +243,31 @@ pub enum Part {
 #[serde(rename_all = "camelCase")]
 pub struct TextPart {
     pub id: String,
+    #[serde(rename = "sessionID", alias = "sessionId")]
     pub session_id: String,
+    #[serde(rename = "messageID", alias = "messageId")]
     pub message_id: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub time: Option<CompletedTime>,
+    pub time: Option<PartTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartTime {
+    pub start: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilePart {
     pub id: String,
+    #[serde(rename = "sessionID", alias = "sessionId")]
     pub session_id: String,
+    #[serde(rename = "messageID", alias = "messageId")]
     pub message_id: String,
     pub mime: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,8 +279,11 @@ pub struct FilePart {
 #[serde(rename_all = "camelCase")]
 pub struct ToolPart {
     pub id: String,
+    #[serde(rename = "sessionID", alias = "sessionId")]
     pub session_id: String,
+    #[serde(rename = "messageID", alias = "messageId")]
     pub message_id: String,
+    #[serde(rename = "callID", alias = "callId")]
     pub call_id: String,
     pub tool: String,
     pub state: Value,
@@ -267,6 +298,7 @@ pub struct PromptPayload {
     pub no_reply: bool,
     pub model: Option<ModelRef>,
     pub agent: Option<String>,
+    #[serde(rename = "messageID", alias = "messageId")]
     pub message_id: Option<String>,
     #[serde(default)]
     pub tools: Option<Value>,
@@ -297,11 +329,13 @@ impl PromptPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionPayload {
+    #[serde(rename = "parentID", alias = "parentId")]
     pub parent_id: Option<String>,
     pub title: Option<String>,
     pub agent: Option<String>,
     pub model: Option<ModelRef>,
     pub permission: Option<Vec<Value>>,
+    #[serde(rename = "workspaceID", alias = "workspaceId")]
     pub workspace_id: Option<String>,
 }
 
@@ -323,6 +357,21 @@ pub fn text_part(session_id: &str, message_id: &str, text: impl Into<String>) ->
         message_id: message_id.to_string(),
         text: text.into(),
         time: None,
+        metadata: None,
+    })
+}
+
+pub fn completed_text_part(session_id: &str, message_id: &str, text: impl Into<String>) -> Part {
+    let now = now_ms();
+    Part::Text(TextPart {
+        id: ids::part_id(),
+        session_id: session_id.to_string(),
+        message_id: message_id.to_string(),
+        text: text.into(),
+        time: Some(PartTime {
+            start: now,
+            end: Some(now),
+        }),
         metadata: None,
     })
 }
@@ -389,7 +438,7 @@ pub fn assistant_message(
             finish: Some("stop".to_string()),
             error: None,
         }),
-        parts: vec![text_part(&session.id, &id, text)],
+        parts: vec![completed_text_part(&session.id, &id, text)],
     }
 }
 

@@ -2,15 +2,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use pi_server::config::ServerConfig;
 use pi_server::opencode_routes::OPENCODE_ROUTES;
-use pi_server::server::app;
+use pi_server::server::{AppState, app, app_with_state};
 use regex::Regex;
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::net::TcpListener;
+use tokio::process::{Child, Command};
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, timeout};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -124,6 +130,10 @@ async fn session_prompt_is_backed_by_a_pi_rpc_process() {
     let body = response_json(response).await;
     assert_eq!(body["info"]["role"], "assistant");
     assert_eq!(body["parts"][0]["text"], "echo: hello");
+    assert!(
+        body["parts"][0]["time"]["end"].is_number(),
+        "assistant text parts need time.end for opencode run output"
+    );
 
     let response = app
         .oneshot(request(
@@ -187,6 +197,255 @@ async fn prompts_on_multiple_sessions_can_run_concurrently() {
     );
 }
 
+#[tokio::test]
+async fn smoke_session_lifecycle_followups_and_events_are_opencode_shaped() {
+    let harness = Harness::new();
+    let state = AppState::new(harness.config());
+    let mut events = state.subscribe_events();
+    let app = app_with_state(state);
+
+    let project = get_json(app.clone(), "/project/current").await;
+    let session = post_json(
+        app.clone(),
+        "/session",
+        json!({ "title": "Smoke root" }),
+        StatusCode::OK,
+    )
+    .await;
+    let session_id = session["id"].as_str().expect("session id");
+    assert_eq!(session["projectID"], project["id"]);
+
+    let created_event = next_event(&mut events, "session.updated").await;
+    assert_eq!(created_event["properties"]["sessionID"], session_id);
+    assert_eq!(created_event["properties"]["info"]["id"], session_id);
+
+    let first = prompt(app.clone(), session_id, "first turn").await;
+    assert_eq!(first["info"]["role"], "assistant");
+    assert_eq!(first["parts"][0]["text"], "echo: first turn");
+    let first_part_event = next_event(&mut events, "message.part.updated").await;
+    assert_eq!(
+        first_part_event["properties"]["part"]["sessionID"],
+        session_id
+    );
+
+    let second = prompt(app.clone(), session_id, "follow up").await;
+    assert_eq!(second["parts"][0]["text"], "echo: follow up");
+
+    let messages = get_json(app.clone(), &format!("/session/{session_id}/message")).await;
+    let messages = messages.as_array().expect("messages array");
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0]["info"]["role"], "user");
+    assert_eq!(messages[1]["info"]["role"], "assistant");
+    assert!(messages[1]["parts"][0]["time"]["end"].is_number());
+    assert_eq!(messages[2]["parts"][0]["text"], "follow up");
+    assert_eq!(messages[3]["info"]["parentID"], messages[2]["info"]["id"]);
+    assert!(messages[3]["parts"][0]["time"]["end"].is_number());
+
+    let updated = patch_json(
+        app.clone(),
+        &format!("/session/{session_id}"),
+        json!({
+            "title": "Renamed smoke",
+            "time": { "archived": 1234 }
+        }),
+    )
+    .await;
+    assert_eq!(updated["title"], "Renamed smoke");
+    assert_eq!(updated["time"]["archived"], 1234);
+    let updated_event = next_event(&mut events, "session.updated").await;
+    assert_eq!(
+        updated_event["properties"]["info"]["title"],
+        "Renamed smoke"
+    );
+
+    let shared = post_json(
+        app.clone(),
+        &format!("/session/{session_id}/share"),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        shared["share"]["url"]
+            .as_str()
+            .expect("share url")
+            .contains(session_id)
+    );
+    let unshared = delete_json(
+        app.clone(),
+        &format!("/session/{session_id}/share"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(unshared.get("share").is_none() || unshared["share"].is_null());
+
+    let forked = post_json(
+        app.clone(),
+        &format!("/session/{session_id}/fork"),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let forked_id = forked["id"].as_str().expect("forked id");
+    assert_eq!(forked["parentID"], session_id);
+    let children = get_json(app.clone(), &format!("/session/{session_id}/children")).await;
+    assert_eq!(children.as_array().expect("children")[0]["id"], forked_id);
+
+    let deleted_child = delete_json(
+        app.clone(),
+        &format!("/session/{forked_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(deleted_child, true);
+    let deleted_event = next_event(&mut events, "session.deleted").await;
+    assert_eq!(deleted_event["properties"]["sessionID"], forked_id);
+    assert_eq!(deleted_event["properties"]["info"]["id"], forked_id);
+
+    let deleted_parent = delete_json(
+        app.clone(),
+        &format!("/session/{session_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(deleted_parent, true);
+    let list = get_json(app, "/session").await;
+    assert!(list.as_array().expect("sessions").is_empty());
+}
+
+#[tokio::test]
+async fn async_prompt_records_the_assistant_followup() {
+    let harness = Harness::new();
+    let app = app(harness.config());
+    let session = create_session(app.clone()).await;
+    let session_id = session["id"].as_str().expect("session id");
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            &format!("/session/{session_id}/prompt_async"),
+            Body::from(json!({ "parts": [{ "type": "text", "text": "background" }] }).to_string()),
+        ))
+        .await
+        .expect("POST prompt_async");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let messages = timeout(Duration::from_secs(2), async {
+        loop {
+            let messages = get_json(app.clone(), &format!("/session/{session_id}/message")).await;
+            if messages.as_array().expect("messages").len() == 2 {
+                return messages;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("async prompt completion");
+
+    assert_eq!(messages[0]["info"]["role"], "user");
+    assert_eq!(messages[1]["info"]["role"], "assistant");
+    assert_eq!(messages[1]["parts"][0]["text"], "echo: background");
+    assert!(messages[1]["parts"][0]["time"]["end"].is_number());
+}
+
+#[tokio::test]
+async fn event_routes_match_opencode_instance_and_global_shapes() {
+    let harness = Harness::new();
+    let (base_url, server) = spawn_test_server(app(harness.config())).await;
+    let client = reqwest::Client::new();
+
+    let mut instance_events = client
+        .get(format!("{base_url}/event"))
+        .send()
+        .await
+        .expect("GET /event");
+    assert_eq!(instance_events.status(), reqwest::StatusCode::OK);
+
+    let mut global_events = client
+        .get(format!("{base_url}/global/event"))
+        .send()
+        .await
+        .expect("GET /global/event");
+    assert_eq!(global_events.status(), reqwest::StatusCode::OK);
+
+    let session = client
+        .post(format!("{base_url}/session"))
+        .send()
+        .await
+        .expect("POST /session");
+    assert_eq!(session.status(), reqwest::StatusCode::OK);
+
+    let instance_event = next_sse_json(&mut instance_events, |value| {
+        value["type"] == "session.updated"
+    })
+    .await;
+    assert_eq!(instance_event["type"], "session.updated");
+    assert!(
+        instance_event.get("payload").is_none(),
+        "/event must stream raw instance events for opencode run"
+    );
+
+    let global_event = next_sse_json(&mut global_events, |value| {
+        value["payload"]["type"] == "session.updated"
+    })
+    .await;
+    assert_eq!(global_event["payload"]["type"], "session.updated");
+    assert!(global_event["directory"].is_string());
+    assert!(global_event["project"].is_string());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn opencode_run_attach_streams_assistant_text() {
+    if Command::new("opencode")
+        .arg("--version")
+        .output()
+        .await
+        .is_err()
+    {
+        eprintln!("Skipping opencode CLI smoke test: opencode not found in PATH");
+        return;
+    }
+
+    let harness = Harness::new();
+    let (base_url, mut server) = spawn_binary_server(&harness).await;
+    let output = timeout(
+        Duration::from_secs(15),
+        Command::new("opencode")
+            .args([
+                "run",
+                "--attach",
+                &base_url,
+                "--format",
+                "json",
+                "attach smoke",
+            ])
+            .output(),
+    )
+    .await
+    .expect("opencode run should finish")
+    .expect("opencode run should execute");
+
+    let _ = server.kill().await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "opencode run failed\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("attach smoke"),
+        "opencode run should stream assistant text\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+}
+
 struct Harness {
     _tmp: TempDir,
     fake_pi: PathBuf,
@@ -226,6 +485,16 @@ async fn create_session(app: axum::Router) -> Value {
     response_json(response).await
 }
 
+async fn prompt(app: axum::Router, session_id: &str, text: &str) -> Value {
+    post_json(
+        app,
+        &format!("/session/{session_id}/message"),
+        json!({ "parts": [{ "type": "text", "text": text }] }),
+        StatusCode::OK,
+    )
+    .await
+}
+
 async fn get_json(app: axum::Router, uri: &str) -> Value {
     let response = app
         .oneshot(request(Method::GET, uri, Body::empty()))
@@ -233,6 +502,46 @@ async fn get_json(app: axum::Router, uri: &str) -> Value {
         .expect("GET route");
     assert_eq!(response.status(), StatusCode::OK);
     response_json(response).await
+}
+
+async fn post_json(app: axum::Router, uri: &str, body: Value, status: StatusCode) -> Value {
+    json_request(app, Method::POST, uri, body, status).await
+}
+
+async fn patch_json(app: axum::Router, uri: &str, body: Value) -> Value {
+    json_request(app, Method::PATCH, uri, body, StatusCode::OK).await
+}
+
+async fn delete_json(app: axum::Router, uri: &str, status: StatusCode) -> Value {
+    json_request(app, Method::DELETE, uri, json!({}), status).await
+}
+
+async fn json_request(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    status: StatusCode,
+) -> Value {
+    let response = app
+        .oneshot(request(method, uri, Body::from(body.to_string())))
+        .await
+        .expect("JSON request");
+    assert_eq!(response.status(), status);
+    response_json(response).await
+}
+
+async fn next_event(rx: &mut broadcast::Receiver<Value>, event_type: &str) -> Value {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let value = rx.recv().await.expect("event");
+            if value["payload"]["type"] == event_type {
+                return value["payload"].clone();
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for event {event_type}"))
 }
 
 fn request(method: Method, uri: &str, body: Body) -> Request<Body> {
@@ -249,6 +558,105 @@ async fn response_json(response: axum::response::Response) -> Value {
         .await
         .expect("response body");
     serde_json::from_slice(&bytes).expect("json response")
+}
+
+async fn spawn_test_server(app: axum::Router) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("test server addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("test server");
+    });
+    (format!("http://{addr}"), server)
+}
+
+async fn spawn_binary_server(harness: &Harness) -> (String, Child) {
+    let port = free_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let binary = std::env::var("CARGO_BIN_EXE_pi-server")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/pi-server")
+        });
+    let mut child = Command::new(binary)
+        .args([
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--pi-bin",
+            harness.fake_pi.to_str().expect("fake pi path"),
+            "--directory",
+            harness.workdir.to_str().expect("workdir path"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pi-server binary");
+
+    let client = reqwest::Client::new();
+    let ready = timeout(Duration::from_secs(5), async {
+        loop {
+            if client
+                .get(format!("{base_url}/global/health"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                return;
+            }
+            assert!(
+                child.try_wait().expect("poll pi-server").is_none(),
+                "pi-server exited before becoming ready"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    if ready.is_err() {
+        let _ = child.kill().await;
+        panic!("timed out waiting for pi-server binary");
+    }
+
+    (base_url, child)
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+    listener.local_addr().expect("free port addr").port()
+}
+
+async fn next_sse_json(
+    response: &mut reqwest::Response,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    timeout(Duration::from_secs(2), async {
+        let mut buffer = String::new();
+        loop {
+            let chunk = response
+                .chunk()
+                .await
+                .expect("SSE chunk")
+                .expect("SSE stream ended");
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(frame_end) = buffer.find("\n\n") {
+                let frame = buffer.drain(..frame_end + 2).collect::<String>();
+                for line in frame.lines() {
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let value: Value = serde_json::from_str(data.trim()).expect("SSE JSON event");
+                    if predicate(&value) {
+                        return value;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for matching SSE event")
 }
 
 fn route_set() -> BTreeSet<(String, String)> {
@@ -372,6 +780,10 @@ fn write_fake_pi(path: &Path) {
         br#"#!/usr/bin/env python3
 import json
 import sys
+
+if sys.argv[1:] != ["--mode", "rpc"]:
+    print("expected --mode rpc, got " + repr(sys.argv[1:]), file=sys.stderr, flush=True)
+    sys.exit(2)
 
 for line in sys.stdin:
     try:
