@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 use crate::ids;
-use crate::models::{MessageWithParts, SessionInfo, now_ms};
+use crate::models::{SessionInfo, now_ms};
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -44,17 +44,6 @@ impl Storage {
                 ON sessions(directory, updated DESC);
             CREATE INDEX IF NOT EXISTS sessions_parent_idx
                 ON sessions(parent_id);
-
-            CREATE TABLE IF NOT EXISTS messages (
-                session_id TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                position INTEGER NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY (session_id, message_id),
-                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS messages_session_position_idx
-                ON messages(session_id, position);
 
             CREATE TABLE IF NOT EXISTS todos (
                 session_id TEXT NOT NULL,
@@ -200,45 +189,6 @@ impl Storage {
         let mut stmt = conn.prepare("SELECT data FROM sessions ORDER BY updated DESC, id DESC")?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|data| serde_json::from_str(&data).map_err(Error::from))
-            .collect()
-    }
-
-    pub fn replace_messages(&self, session_id: &str, messages: &[MessageWithParts]) -> Result<()> {
-        let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        {
-            let mut stmt = tx.prepare(
-                r#"
-                INSERT INTO messages (session_id, message_id, position, data)
-                VALUES (?1, ?2, ?3, ?4)
-                "#,
-            )?;
-            for (position, message) in messages.iter().enumerate() {
-                stmt.execute(params![
-                    session_id,
-                    message.info.id(),
-                    position as i64,
-                    serde_json::to_string(message)?,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn list_messages(&self, session_id: &str) -> Result<Vec<MessageWithParts>> {
-        let conn = self.conn()?;
-        let mut stmt =
-            conn.prepare("SELECT data FROM messages WHERE session_id = ?1 ORDER BY position ASC")?;
-        let rows = stmt
-            .query_map(params![session_id], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(|data| serde_json::from_str(&data).map_err(Error::from))

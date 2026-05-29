@@ -11,6 +11,7 @@ use pi_server::ids;
 use pi_server::opencode_routes::OPENCODE_ROUTES;
 use pi_server::server::{AppState, app, app_with_state};
 use regex::Regex;
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -114,7 +115,7 @@ async fn bootstrap_routes_return_attach_compatible_shapes() {
 }
 
 #[tokio::test]
-async fn sqlite_storage_persists_projects_sessions_and_messages() {
+async fn sqlite_storage_persists_projects_and_sessions_while_pi_owns_messages() {
     let harness = Harness::new();
     let session_id;
     let project_id;
@@ -153,6 +154,18 @@ async fn sqlite_storage_persists_projects_sessions_and_messages() {
     assert_eq!(sessions.as_array().expect("sessions").len(), 1);
     assert_eq!(sessions[0]["id"], session_id);
     assert_eq!(sessions[0]["title"], "Persist me");
+    let conn = Connection::open(harness.config().database).expect("open pi-server sqlite");
+    let message_table: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    assert!(
+        message_table.is_none(),
+        "pi-server sqlite must not persist message history"
+    );
 
     let messages = get_json(app.clone(), &format!("/session/{session_id}/message")).await;
     assert_eq!(messages.as_array().expect("messages").len(), 2);
@@ -2477,7 +2490,21 @@ fn write_fake_pi(path: &Path) {
     file.write_all(
         br#"#!/usr/bin/env python3
 import json
+import os
 import sys
+
+session_path = os.path.join(os.getcwd(), ".fake-pi-session.json")
+
+def load_messages():
+    try:
+        with open(session_path) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_messages(messages):
+    with open(session_path, "w") as f:
+        json.dump(messages, f)
 
 if sys.argv[1:] != ["--mode", "rpc"]:
     print("expected --mode rpc, got " + repr(sys.argv[1:]), file=sys.stderr, flush=True)
@@ -2492,6 +2519,8 @@ for line in sys.stdin:
     command = request.get("type")
     if command == "prompt":
         message = request.get("message", "")
+        messages = load_messages()
+        user_message = {"role": "user", "content": [{"type": "text", "text": message}], "timestamp": 0}
         print(json.dumps({"type": "response", "id": request_id, "command": "prompt", "success": True}), flush=True)
         if message == "stream events":
             assistant = {
@@ -2586,23 +2615,28 @@ for line in sys.stdin:
                 "messages": [{**assistant, "content": [{"type": "text", "text": "streamed answer"}]}],
                 "error": None
             }), flush=True)
+            messages.extend([user_message, {**assistant, "content": [{"type": "text", "text": "streamed answer"}]}])
+            save_messages(messages)
             continue
+        assistant = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "echo: " + message}],
+            "api": "test",
+            "provider": "test",
+            "model": "test",
+            "usage": {},
+            "stopReason": "stop",
+            "timestamp": 0
+        }
         print(json.dumps({
             "type": "agent_end",
-            "messages": [{
-                "role": "assistant",
-                "content": [{"type": "text", "text": "echo: " + message}],
-                "api": "test",
-                "provider": "test",
-                "model": "test",
-                "usage": {},
-                "stopReason": "stop",
-                "timestamp": 0
-            }],
+            "messages": [assistant],
             "error": None
         }), flush=True)
+        messages.extend([user_message, assistant])
+        save_messages(messages)
     elif command == "get_messages":
-        print(json.dumps({"type": "response", "id": request_id, "command": "get_messages", "success": True, "data": {"messages": []}}), flush=True)
+        print(json.dumps({"type": "response", "id": request_id, "command": "get_messages", "success": True, "data": {"messages": load_messages()}}), flush=True)
     else:
         print(json.dumps({"type": "response", "id": request_id, "command": command, "success": True}), flush=True)
 "#,

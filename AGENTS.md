@@ -8,7 +8,7 @@ Core layout:
 
 - `src/server.rs`: Axum routes, session state, SSE event publishing, opencode compatibility surface.
 - `src/pi_rpc.rs`: JSON-RPC process wrapper for `pi --mode rpc`.
-- `src/storage.rs`: SQLite-backed project/session/message metadata storage.
+- `src/storage.rs`: SQLite-backed project/session/todo metadata storage. Message history is owned by `pi_agent_rust` session storage and accessed through `pi --mode rpc`.
 - `src/models.rs`: OpenCode-shaped API/event models.
 - `src/ids.rs`: sortable OpenCode-style IDs for sessions, messages, and parts.
 - `src/config.rs`: CLI/env config. `PI_BIN_PATH` defaults to `~/.local/bin/pi`; `PI_SERVER_DB` defaults to `~/.pi-server.db`.

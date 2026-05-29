@@ -28,8 +28,9 @@ use crate::config::ServerConfig;
 use crate::error::{Error, Result};
 use crate::ids;
 use crate::models::{
-    CreateSessionPayload, FileNode, MessageInfo, MessageWithParts, Part, PartTime, PromptPayload,
-    SessionInfo, TextPart, ToolPart, assistant_message_pending_with_id, assistant_message_with_id,
+    AssistantMessageInfo, CompletedTime, CreateSessionPayload, CreatedTime, FileNode, MessageInfo,
+    MessagePath, MessageWithParts, Part, PartTime, PromptPayload, SessionInfo, TextPart, Tokens,
+    ToolPart, UserMessageInfo, assistant_message_pending_with_id, assistant_message_with_id,
     now_ms, path_to_string, user_message,
 };
 use crate::opencode_routes::OPENCODE_ROUTES;
@@ -98,13 +99,12 @@ impl AppState {
             .list_sessions()?
             .into_iter()
             .map(|info| {
-                let messages = storage.list_messages(&info.id)?;
                 Ok((
                     info.id.clone(),
                     Arc::new(Mutex::new(SessionRecord {
                         info,
                         rpc: None,
-                        messages,
+                        messages: Vec::new(),
                         live: LiveSessionState::default(),
                     })),
                 ))
@@ -425,10 +425,26 @@ impl AppState {
         Ok(rpc)
     }
 
+    async fn ensure_messages_loaded(&self, record: &Arc<Mutex<SessionRecord>>) -> Result<()> {
+        if !record.lock().await.messages.is_empty() {
+            return Ok(());
+        }
+        let rpc = self.ensure_record_rpc(record).await?;
+        let raw_messages = rpc.get_messages().await?;
+        if raw_messages.is_empty() {
+            return Ok(());
+        }
+        let info = record.lock().await.info.clone();
+        let messages = pi_messages_to_opencode(&info, raw_messages);
+        let mut record = record.lock().await;
+        if record.messages.is_empty() {
+            record.messages = messages;
+        }
+        Ok(())
+    }
+
     fn persist_record(&self, record: &SessionRecord) -> Result<()> {
         self.storage.save_session(&record.info)?;
-        self.storage
-            .replace_messages(&record.info.id, &record.messages)?;
         Ok(())
     }
 
@@ -1104,6 +1120,126 @@ fn validate_todo(todo: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn pi_messages_to_opencode(
+    session: &SessionInfo,
+    raw_messages: Vec<Value>,
+) -> Vec<MessageWithParts> {
+    let base_time = now_ms().saturating_sub(raw_messages.len() as i64);
+    let mut messages = Vec::new();
+    let mut last_user_id: Option<String> = None;
+    let directory = PathBuf::from(&session.directory);
+    for (index, raw) in raw_messages.into_iter().enumerate() {
+        let role = raw.get("role").and_then(Value::as_str).unwrap_or_default();
+        let text = extract_content_text(raw.get("content").unwrap_or(&Value::Null));
+        if text.is_empty() {
+            continue;
+        }
+        let created = pi_message_time(&raw).unwrap_or(base_time + index as i64);
+        let id = synthetic_message_id(created, index);
+        match role {
+            "user" => {
+                last_user_id = Some(id.clone());
+                messages.push(MessageWithParts {
+                    info: MessageInfo::User(UserMessageInfo {
+                        id: id.clone(),
+                        session_id: session.id.clone(),
+                        time: CreatedTime { created },
+                        agent: session.agent.clone().unwrap_or_else(|| "build".to_string()),
+                        model: session.model.clone().unwrap_or_default(),
+                        system: None,
+                        tools: None,
+                    }),
+                    parts: vec![synthetic_text_part(&session.id, &id, created, text, false)],
+                });
+            }
+            "assistant" => {
+                let parent_id = last_user_id
+                    .clone()
+                    .or_else(|| messages.last().map(|message| message.info.id().to_string()))
+                    .unwrap_or_else(|| synthetic_message_id(created.saturating_sub(1), index));
+                let model = session.model.clone().unwrap_or_default();
+                messages.push(MessageWithParts {
+                    info: MessageInfo::Assistant(AssistantMessageInfo {
+                        id: id.clone(),
+                        session_id: session.id.clone(),
+                        time: CompletedTime {
+                            created,
+                            completed: Some(created),
+                        },
+                        parent_id,
+                        model_id: model.model_id,
+                        provider_id: model.provider_id,
+                        mode: session.agent.clone().unwrap_or_else(|| "build".to_string()),
+                        agent: session.agent.clone().unwrap_or_else(|| "build".to_string()),
+                        path: MessagePath {
+                            cwd: directory.display().to_string(),
+                            root: directory.display().to_string(),
+                        },
+                        cost: 0.0,
+                        tokens: Tokens::default(),
+                        finish: Some(
+                            raw.get("stopReason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("stop")
+                                .to_string(),
+                        ),
+                        error: None,
+                    }),
+                    parts: vec![synthetic_text_part(&session.id, &id, created, text, true)],
+                });
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
+fn synthetic_message_id(created: i64, index: usize) -> String {
+    let sequence = (created.max(0) as u64)
+        .saturating_mul(4096)
+        .saturating_add(index as u64);
+    format!("msg_{:012x}{:014}", sequence & 0x0000_ffff_ffff_ffff, 0)
+}
+
+fn synthetic_part_id(created: i64, index: usize) -> String {
+    let sequence = (created.max(0) as u64)
+        .saturating_mul(4096)
+        .saturating_add(index as u64);
+    format!("prt_{:012x}{:014}", sequence & 0x0000_ffff_ffff_ffff, 0)
+}
+
+fn synthetic_text_part(
+    session_id: &str,
+    message_id: &str,
+    created: i64,
+    text: String,
+    completed: bool,
+) -> Part {
+    Part::Text(TextPart {
+        id: synthetic_part_id(created, 0),
+        session_id: session_id.to_string(),
+        message_id: message_id.to_string(),
+        text,
+        time: Some(PartTime {
+            start: created,
+            end: completed.then_some(created),
+        }),
+        metadata: None,
+    })
+}
+
+fn pi_message_time(raw: &Value) -> Option<i64> {
+    let value = raw.get("timestamp").and_then(Value::as_i64)?;
+    if value <= 0 {
+        return None;
+    }
+    Some(if value > 1_000_000_000_000 {
+        value
+    } else {
+        value.saturating_mul(1000)
+    })
 }
 
 fn permission_response(payload: &Value) -> Result<String> {
@@ -2099,6 +2235,7 @@ async fn update_session(
         ));
     }
     let record = state.get_session(&session_id).await?;
+    state.ensure_messages_loaded(&record).await?;
     let mut record = record.lock().await;
     if let Some(title) = patch.get("title") {
         let title = title
@@ -2287,6 +2424,7 @@ async fn prompt_session_async(
     }
     let record = state.get_session(&session_id).await?;
     let rpc = state.ensure_record_rpc(&record).await?;
+    state.ensure_messages_loaded(&record).await?;
     let (rpc, user, directory, assistant_id) = {
         let mut record = record.lock().await;
         let user = user_message(&record.info, &payload, text.clone());
@@ -2348,6 +2486,7 @@ async fn prompt_impl(
 
     let record = state.get_session(&session_id).await?;
     let rpc = state.ensure_record_rpc(&record).await?;
+    state.ensure_messages_loaded(&record).await?;
     let (rpc, user, directory, assistant_id) = {
         let mut record = record.lock().await;
         let user = user_message(&record.info, &payload, text.clone());
@@ -2540,6 +2679,7 @@ async fn session_messages_paged(
 
 async fn session_messages_all(state: &AppState, session_id: &str) -> Result<Vec<MessageWithParts>> {
     let record = state.get_session(session_id).await?;
+    state.ensure_messages_loaded(&record).await?;
     Ok(record.lock().await.messages.clone())
 }
 
@@ -2614,6 +2754,7 @@ async fn session_message(
     AxumPath((session_id, message_id)): AxumPath<(String, String)>,
 ) -> Result<Json<MessageWithParts>> {
     let record = state.get_session(&session_id).await?;
+    state.ensure_messages_loaded(&record).await?;
     record
         .lock()
         .await
@@ -2631,6 +2772,7 @@ async fn delete_session_message(
 ) -> Result<Json<bool>> {
     let record = state.get_session(&session_id).await?;
     state.ensure_not_busy(&session_id).await?;
+    state.ensure_messages_loaded(&record).await?;
     let mut record = record.lock().await;
     let Some(index) = record
         .messages
@@ -2659,6 +2801,7 @@ async fn update_message_part(
         return Err(Error::bad_request("part identity does not match path"));
     }
     let record = state.get_session(&session_id).await?;
+    state.ensure_messages_loaded(&record).await?;
     let mut record = record.lock().await;
     let message = record
         .messages
@@ -2683,6 +2826,7 @@ async fn delete_message_part(
     AxumPath((session_id, message_id, part_id)): AxumPath<(String, String, String)>,
 ) -> Result<Json<bool>> {
     let record = state.get_session(&session_id).await?;
+    state.ensure_messages_loaded(&record).await?;
     let mut record = record.lock().await;
     let message = record
         .messages
@@ -2725,6 +2869,7 @@ async fn fork_session(
         .and_then(Value::as_str)
         .map(str::to_string);
     let parent = state.get_session(&session_id).await?;
+    state.ensure_messages_loaded(&parent).await?;
     let (title, directory, workspace_id, messages) = {
         let parent = parent.lock().await;
         (

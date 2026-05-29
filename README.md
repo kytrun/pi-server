@@ -50,7 +50,7 @@ Configuration:
 | Live event stream | Working | User/assistant messages, text deltas, thinking, tool calls, session status, and directory-scoped desktop events are covered. |
 | File/project/bootstrap routes | Partial | Enough shape compatibility for current clients; many routes are lightweight stubs. |
 | Full `opencode serve` API parity | Incomplete | Route matrix is tracked, but not every endpoint has full behavior. |
-| Persistence across server restarts | Partial | Project/session/message metadata is stored in SQLite; live `pi` RPC processes are restarted lazily when a persisted session is prompted. |
+| Persistence across server restarts | Partial | Project/session metadata is stored in SQLite; message history is loaded from `pi_agent_rust` session storage through `pi --mode rpc`. |
 
 ## API Endpoint Status
 
