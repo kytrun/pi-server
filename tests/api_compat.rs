@@ -76,6 +76,18 @@ async fn bootstrap_routes_return_attach_compatible_shapes() {
     let harness = Harness::new();
     let app = app(harness.config());
 
+    let projects = get_json(app.clone(), "/project").await;
+    let project = &projects.as_array().expect("projects array")[0];
+    assert!(project["id"].as_str().is_some());
+    assert_eq!(project["worktree"], harness.workdir.display().to_string());
+    assert!(project["time"]["created"].is_number());
+    assert!(project["time"]["updated"].is_number());
+    assert!(project["sandboxes"].is_array());
+
+    let current_project = get_json(app.clone(), "/project/current").await;
+    assert_eq!(current_project["id"], project["id"]);
+    assert!(current_project["time"]["updated"].is_number());
+
     let config_providers = get_json(app.clone(), "/config/providers").await;
     assert!(config_providers["providers"].is_array());
     assert_eq!(config_providers["providers"][0]["id"], "pi");
@@ -123,6 +135,214 @@ async fn tui_can_create_a_new_session_with_selected_model_shape() {
     assert_eq!(session["agent"], "build");
     assert_eq!(session["model"]["providerID"], "pi");
     assert_eq!(session["model"]["modelID"], "default");
+}
+
+#[tokio::test]
+async fn session_create_emits_desktop_sidebar_created_before_updated() {
+    let harness = Harness::new();
+    let state = AppState::new(harness.config());
+    let mut events = state.subscribe_events();
+    let app = app_with_state(state);
+
+    let session = create_session(app.clone()).await;
+    let session_id = session["id"].as_str().expect("session id");
+
+    let created = next_event(&mut events, "session.created").await;
+    assert_eq!(created["properties"]["sessionID"], session_id);
+    assert_eq!(created["properties"]["info"]["id"], session_id);
+
+    let updated = next_event(&mut events, "session.updated").await;
+    assert_eq!(updated["properties"]["sessionID"], session_id);
+
+    let directory = harness.workdir.to_str().expect("workdir");
+    let sessions = get_json(
+        app.clone(),
+        &format!("/session?directory={directory}&roots=true&limit=10"),
+    )
+    .await;
+    assert_eq!(sessions.as_array().expect("sessions").len(), 1);
+    assert_eq!(sessions[0]["id"], session_id);
+
+    let forked = post_json(
+        app.clone(),
+        &format!("/session/{session_id}/fork"),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let forked_id = forked["id"].as_str().expect("fork id");
+    let _fork_created = next_event(&mut events, "session.created").await;
+    let _fork_updated = next_event(&mut events, "session.updated").await;
+
+    let roots = get_json(
+        app.clone(),
+        &format!("/session?directory={directory}&roots=true"),
+    )
+    .await;
+    assert_eq!(roots.as_array().expect("root sessions").len(), 1);
+    assert_eq!(roots[0]["id"], session_id);
+
+    let all = get_json(app, &format!("/session?directory={directory}")).await;
+    assert_eq!(
+        all.as_array()
+            .expect("all sessions")
+            .iter()
+            .map(|session| session["id"].as_str().expect("id"))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([session_id, forked_id])
+    );
+}
+
+#[tokio::test]
+async fn desktop_session_create_uses_directory_header_for_sidebar_lists() {
+    let harness = Harness::new();
+    let state = AppState::new(harness.config());
+    let mut events = state.subscribe_events();
+    let app = app_with_state(state);
+    let desktop_directory = harness._tmp.path().join("desktop-project");
+    fs::create_dir(&desktop_directory).expect("desktop project dir");
+    let encoded_directory = encode_component(&desktop_directory.display().to_string());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/session")
+                .header("content-type", "application/json")
+                .header("x-opencode-directory", encoded_directory.clone())
+                .body(Body::from(
+                    json!({ "title": "Desktop session" }).to_string(),
+                ))
+                .expect("desktop create session request"),
+        )
+        .await
+        .expect("POST /session");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let session = response_json(response).await;
+    let session_id = session["id"].as_str().expect("session id");
+    let directory = desktop_directory.display().to_string();
+    assert_eq!(session["directory"], directory);
+
+    let created = next_wrapped_event(&mut events, "session.created").await;
+    assert_eq!(created["directory"], directory);
+    assert_eq!(created["payload"]["properties"]["sessionID"], session_id);
+
+    let updated = next_wrapped_event(&mut events, "session.updated").await;
+    assert_eq!(updated["directory"], directory);
+    assert_eq!(updated["payload"]["properties"]["sessionID"], session_id);
+
+    let desktop_sessions = get_json(
+        app.clone(),
+        &format!("/session?directory={encoded_directory}&roots=true&limit=10"),
+    )
+    .await;
+    assert_eq!(
+        desktop_sessions
+            .as_array()
+            .expect("desktop sessions")
+            .iter()
+            .map(|session| session["id"].as_str().expect("id"))
+            .collect::<Vec<_>>(),
+        vec![session_id]
+    );
+
+    let default_sessions = get_json(
+        app.clone(),
+        &format!(
+            "/session?directory={}",
+            encode_component(&harness.workdir.display().to_string())
+        ),
+    )
+    .await;
+    assert!(
+        default_sessions
+            .as_array()
+            .expect("default sessions")
+            .is_empty(),
+        "desktop-created session should not be hidden under the server cwd"
+    );
+
+    let paths = get_json(app, &format!("/path?directory={encoded_directory}")).await;
+    assert_eq!(paths["directory"], directory);
+    assert_eq!(paths["worktree"], directory);
+}
+
+#[tokio::test]
+async fn desktop_prompt_events_are_published_to_the_session_directory() {
+    let harness = Harness::new();
+    let state = AppState::new(harness.config());
+    let mut events = state.subscribe_events();
+    let app = app_with_state(state);
+    let desktop_directory = harness._tmp.path().join("desktop-project");
+    fs::create_dir(&desktop_directory).expect("desktop project dir");
+    let encoded_directory = encode_component(&desktop_directory.display().to_string());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/session")
+                .header("content-type", "application/json")
+                .header("x-opencode-directory", encoded_directory)
+                .body(Body::empty())
+                .expect("desktop create session request"),
+        )
+        .await
+        .expect("POST /session");
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = response_json(response).await;
+    let session_id = session["id"].as_str().expect("session id");
+    let directory = desktop_directory.display().to_string();
+    let _created = next_wrapped_event(&mut events, "session.created").await;
+    let _updated = next_wrapped_event(&mut events, "session.updated").await;
+
+    let assistant = prompt(app, session_id, "desktop live response").await;
+    assert_eq!(assistant["info"]["role"], "assistant");
+
+    let mut saw_assistant_message = false;
+    let mut saw_assistant_part = false;
+    let mut saw_idle_status = false;
+    timeout(Duration::from_secs(2), async {
+        while !(saw_assistant_message && saw_assistant_part && saw_idle_status) {
+            let event = events.recv().await.expect("event");
+            if event["payload"]["properties"]["sessionID"] != session_id {
+                continue;
+            }
+            let event_type = event["payload"]["type"].as_str().expect("event type");
+            match event_type {
+                "message.updated"
+                | "message.part.updated"
+                | "message.part.delta"
+                | "session.status" => {
+                    assert_eq!(
+                        event["directory"], directory,
+                        "{event_type} should be routed to the session directory"
+                    );
+                }
+                _ => continue,
+            }
+            if event_type == "message.updated"
+                && event["payload"]["properties"]["info"]["role"] == "assistant"
+            {
+                saw_assistant_message = true;
+            }
+            if event_type == "message.part.updated"
+                && event["payload"]["properties"]["part"]["messageID"] == assistant["info"]["id"]
+            {
+                saw_assistant_part = true;
+            }
+            if event_type == "session.status"
+                && event["payload"]["properties"]["status"]["type"] == "idle"
+            {
+                saw_idle_status = true;
+            }
+        }
+    })
+    .await
+    .expect("prompt events for desktop session");
 }
 
 #[tokio::test]
@@ -574,6 +794,16 @@ async fn event_routes_match_opencode_instance_and_global_shapes() {
         .expect("GET /global/event");
     assert_eq!(global_events.status(), reqwest::StatusCode::OK);
 
+    let global_connected = next_sse_json(&mut global_events, |value| {
+        value["payload"]["type"] == "server.connected"
+    })
+    .await;
+    assert_eq!(global_connected["payload"]["type"], "server.connected");
+    assert!(
+        global_connected.get("directory").is_none(),
+        "global server.connected must stay global so desktop refreshes global project state"
+    );
+
     let session = client
         .post(format!("{base_url}/session"))
         .send()
@@ -772,6 +1002,32 @@ async fn next_event(rx: &mut broadcast::Receiver<Value>, event_type: &str) -> Va
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for event {event_type}"))
+}
+
+async fn next_wrapped_event(rx: &mut broadcast::Receiver<Value>, event_type: &str) -> Value {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let value = rx.recv().await.expect("event");
+            if value["payload"]["type"] == event_type {
+                return value;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for wrapped event {event_type}"))
+}
+
+fn encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn request(method: Method, uri: &str, body: Body) -> Request<Body> {

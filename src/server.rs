@@ -97,11 +97,13 @@ impl AppState {
             .ok_or_else(|| Error::not_found(format!("session not found: {session_id}")))
     }
 
-    async fn create_session(&self, payload: Option<CreateSessionPayload>) -> Result<SessionInfo> {
-        let mut info = SessionInfo::new(
-            &self.config.directory,
-            payload.as_ref().and_then(|p| p.title.clone()),
-        );
+    async fn create_session(
+        &self,
+        payload: Option<CreateSessionPayload>,
+        directory: Option<PathBuf>,
+    ) -> Result<SessionInfo> {
+        let directory = directory.unwrap_or_else(|| self.config.directory.clone());
+        let mut info = SessionInfo::new(&directory, payload.as_ref().and_then(|p| p.title.clone()));
         info.project_id = self.project_id.clone();
         if let Some(payload) = payload {
             info.parent_id = payload.parent_id;
@@ -111,7 +113,7 @@ impl AppState {
             info.workspace_id = payload.workspace_id;
         }
 
-        let rpc = PiRpcClient::spawn(&self.config.pi_bin, &self.config.directory).await?;
+        let rpc = PiRpcClient::spawn(&self.config.pi_bin, &directory).await?;
         let record = Arc::new(Mutex::new(SessionRecord {
             info: info.clone(),
             rpc: Arc::clone(&rpc),
@@ -123,13 +125,14 @@ impl AppState {
             .await
             .insert(info.id.clone(), Arc::clone(&record));
         self.forward_session_events(&info, rpc, Arc::clone(&record));
+        self.publish_session_created(&info);
         self.publish_session_updated(&info);
         Ok(info)
     }
 
-    fn publish(&self, payload: Value) {
+    fn publish_for_directory(&self, directory: String, payload: Value) {
         let _ = self.global_events.send(json!({
-            "directory": self.config.directory.display().to_string(),
+            "directory": directory,
             "project": self.project_id.clone(),
             "workspace": null,
             "payload": payload,
@@ -137,86 +140,120 @@ impl AppState {
     }
 
     fn publish_session_updated(&self, info: &SessionInfo) {
-        self.publish(json!({
-            "type": "session.updated",
-            "properties": {
-                "sessionID": info.id,
-                "info": info,
-            },
-        }));
+        self.publish_for_directory(
+            info.directory.clone(),
+            json!({
+                "type": "session.updated",
+                "properties": {
+                    "sessionID": info.id,
+                    "info": info,
+                },
+            }),
+        );
+    }
+
+    fn publish_session_created(&self, info: &SessionInfo) {
+        self.publish_for_directory(
+            info.directory.clone(),
+            json!({
+                "type": "session.created",
+                "properties": {
+                    "sessionID": info.id,
+                    "info": info,
+                },
+            }),
+        );
     }
 
     fn publish_session_deleted(&self, info: &SessionInfo) {
-        self.publish(json!({
-            "type": "session.deleted",
-            "properties": {
-                "sessionID": info.id,
-                "info": info,
-            },
-        }));
+        self.publish_for_directory(
+            info.directory.clone(),
+            json!({
+                "type": "session.deleted",
+                "properties": {
+                    "sessionID": info.id,
+                    "info": info,
+                },
+            }),
+        );
     }
 
-    fn publish_message(&self, message: &MessageWithParts) {
+    fn publish_message(&self, directory: &str, message: &MessageWithParts) {
         let session_id = message.info.session_id();
         let assistant = matches!(&message.info, MessageInfo::Assistant(_));
-        self.publish(json!({
-            "type": "message.updated",
-            "properties": {
-                "sessionID": session_id,
-                "info": &message.info,
-            },
-        }));
+        self.publish_for_directory(
+            directory.to_string(),
+            json!({
+                "type": "message.updated",
+                "properties": {
+                    "sessionID": session_id,
+                    "info": &message.info,
+                },
+            }),
+        );
         for part in &message.parts {
             if assistant && let Some(delta) = text_delta(part) {
-                self.publish_part_updated(session_id, started_part(part));
-                self.publish(json!({
-                    "type": "message.part.delta",
-                    "properties": {
-                        "sessionID": session_id,
-                        "messageID": delta.message_id,
-                        "partID": delta.part_id,
-                        "field": "text",
-                        "delta": delta.text,
-                    },
-                }));
+                self.publish_part_updated(directory, session_id, started_part(part));
+                self.publish_for_directory(
+                    directory.to_string(),
+                    json!({
+                        "type": "message.part.delta",
+                        "properties": {
+                            "sessionID": session_id,
+                            "messageID": delta.message_id,
+                            "partID": delta.part_id,
+                            "field": "text",
+                            "delta": delta.text,
+                        },
+                    }),
+                );
             }
-            self.publish_part_updated(session_id, json!(part));
+            self.publish_part_updated(directory, session_id, json!(part));
         }
     }
 
-    fn publish_message_snapshot(&self, message: &MessageWithParts) {
+    fn publish_message_snapshot(&self, directory: &str, message: &MessageWithParts) {
         let session_id = message.info.session_id();
-        self.publish(json!({
-            "type": "message.updated",
-            "properties": {
-                "sessionID": session_id,
-                "info": &message.info,
-            },
-        }));
+        self.publish_for_directory(
+            directory.to_string(),
+            json!({
+                "type": "message.updated",
+                "properties": {
+                    "sessionID": session_id,
+                    "info": &message.info,
+                },
+            }),
+        );
         for part in &message.parts {
-            self.publish_part_updated(session_id, json!(part));
+            self.publish_part_updated(directory, session_id, json!(part));
         }
     }
 
-    fn publish_part_updated(&self, session_id: &str, part: Value) {
-        self.publish(json!({
-            "type": "message.part.updated",
-            "properties": {
-                "sessionID": session_id,
-                "part": part,
-                "time": now_ms(),
-            },
-        }));
+    fn publish_part_updated(&self, directory: &str, session_id: &str, part: Value) {
+        self.publish_for_directory(
+            directory.to_string(),
+            json!({
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": session_id,
+                    "part": part,
+                    "time": now_ms(),
+                },
+            }),
+        );
     }
 
-    fn publish_session_status(&self, session_id: &str, status: Value) {
-        self.publish(json!({
-            "type": "session.status",
-            "properties": {
-                "sessionID": session_id,
-                "status": status,
-            },
-        }));
+    fn publish_session_status(&self, directory: &str, session_id: &str, status: Value) {
+        self.publish_for_directory(
+            directory.to_string(),
+            json!({
+                "type": "session.status",
+                "properties": {
+                    "sessionID": session_id,
+                    "status": status,
+                },
+            }),
+        );
     }
 
     async fn set_session_status(&self, session_id: &str, status: Value) {
@@ -228,7 +265,11 @@ impl AppState {
                 .await
                 .insert(session_id.to_string(), status.clone());
         }
-        self.publish_session_status(session_id, status);
+        let directory = match self.get_session(session_id).await {
+            Ok(record) => record.lock().await.info.directory.clone(),
+            Err(_) => self.config.directory.display().to_string(),
+        };
+        self.publish_session_status(&directory, session_id, status);
     }
 
     fn forward_session_events(
@@ -239,7 +280,7 @@ impl AppState {
     ) {
         let mut rx = rpc.subscribe();
         let tx = self.global_events.clone();
-        let directory = self.config.directory.display().to_string();
+        let directory = session.directory.clone();
         let project = self.project_id.clone();
         let session_id = session.id.clone();
         let state = self.clone();
@@ -322,13 +363,16 @@ impl AppState {
             live.message_id.clone(),
             &live.directory,
         );
-        self.publish(json!({
-            "type": "message.updated",
-            "properties": {
-                "sessionID": record.info.id.clone(),
-                "info": info,
-            },
-        }));
+        self.publish_for_directory(
+            record.info.directory.clone(),
+            json!({
+                "type": "message.updated",
+                "properties": {
+                    "sessionID": record.info.id.clone(),
+                    "info": info,
+                },
+            }),
+        );
     }
 
     fn publish_assistant_message_event(
@@ -375,7 +419,7 @@ impl AppState {
         let Some(part) = ensure_live_text_part(record, kind, &key) else {
             return;
         };
-        self.publish_part_updated(session_id, part);
+        self.publish_part_updated(&record.info.directory, session_id, part);
     }
 
     fn publish_live_text_delta(
@@ -397,18 +441,21 @@ impl AppState {
             return;
         };
         if let Some(started) = maybe_started {
-            self.publish_part_updated(session_id, started);
+            self.publish_part_updated(&record.info.directory, session_id, started);
         }
-        self.publish(json!({
-            "type": "message.part.delta",
-            "properties": {
-                "sessionID": session_id,
-                "messageID": message_id,
-                "partID": part_id,
-                "field": "text",
-                "delta": delta,
-            },
-        }));
+        self.publish_for_directory(
+            record.info.directory.clone(),
+            json!({
+                "type": "message.part.delta",
+                "properties": {
+                    "sessionID": session_id,
+                    "messageID": message_id,
+                    "partID": part_id,
+                    "field": "text",
+                    "delta": delta,
+                },
+            }),
+        );
     }
 
     fn publish_live_text_end(
@@ -426,7 +473,7 @@ impl AppState {
         let Some(part) = finish_live_text_part(record, kind, &key, content) else {
             return;
         };
-        self.publish_part_updated(session_id, part);
+        self.publish_part_updated(&record.info.directory, session_id, part);
     }
 
     fn publish_tool_call_pending(
@@ -455,7 +502,7 @@ impl AppState {
             "raw": input.to_string(),
         });
         if let Some(part) = upsert_live_tool_part(record, call_id, tool, state) {
-            self.publish_part_updated(session_id, part);
+            self.publish_part_updated(&record.info.directory, session_id, part);
         }
     }
 
@@ -480,7 +527,7 @@ impl AppState {
             "time": { "start": now_ms() },
         });
         if let Some(part) = upsert_live_tool_part(record, call_id, tool, state) {
-            self.publish_part_updated(session_id, part);
+            self.publish_part_updated(&record.info.directory, session_id, part);
         }
     }
 
@@ -510,7 +557,7 @@ impl AppState {
             "time": { "start": live_tool_start(record, call_id).unwrap_or_else(now_ms) },
         });
         if let Some(part) = upsert_live_tool_part(record, call_id, tool, state) {
-            self.publish_part_updated(session_id, part);
+            self.publish_part_updated(&record.info.directory, session_id, part);
         }
     }
 
@@ -561,7 +608,7 @@ impl AppState {
             })
         };
         if let Some(part) = upsert_live_tool_part(record, call_id, tool, state) {
-            self.publish_part_updated(session_id, part);
+            self.publish_part_updated(&record.info.directory, session_id, part);
         }
     }
 }
@@ -1068,9 +1115,6 @@ fn event_stream(
             "properties": {},
         }),
         EventStreamShape::Global => json!({
-            "directory": state.config.directory.display().to_string(),
-            "project": state.project_id.clone(),
-            "workspace": null,
             "payload": {
                 "type": "server.connected",
                 "properties": {},
@@ -1106,23 +1150,96 @@ fn instance_event_payload(value: Value) -> Value {
     }
 }
 
-async fn create_session(State(state): State<AppState>, body: Bytes) -> Result<Json<SessionInfo>> {
-    let payload = parse_optional_json::<CreateSessionPayload>(&body)?;
-    state.create_session(payload).await.map(Json)
+fn request_directory_header(headers: &HeaderMap) -> Option<PathBuf> {
+    headers
+        .get("x-opencode-directory")
+        .and_then(|value| value.to_str().ok())
+        .and_then(percent_decode)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
 }
 
-async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionInfo>> {
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push(hex_value(high)? << 4 | hex_value(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+async fn create_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SessionInfo>> {
+    let payload = parse_optional_json::<CreateSessionPayload>(&body)?;
+    state
+        .create_session(payload, request_directory_header(&headers))
+        .await
+        .map(Json)
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ListSessionsQuery {
+    directory: Option<String>,
+    roots: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<ListSessionsQuery>,
+) -> Json<Vec<SessionInfo>> {
     let sessions = state.sessions.read().await;
     let mut items = Vec::with_capacity(sessions.len());
     for record in sessions.values() {
-        items.push(record.lock().await.info.clone());
+        let info = record.lock().await.info.clone();
+        if let Some(directory) = query.directory.as_deref()
+            && path_to_string(PathBuf::from(&info.directory))
+                != path_to_string(PathBuf::from(directory))
+        {
+            continue;
+        }
+        if query.roots.as_deref().is_some_and(|roots| roots == "true") && info.parent_id.is_some() {
+            continue;
+        }
+        items.push(info);
     }
     items.sort_by(|a, b| b.time.updated.cmp(&a.time.updated));
+    if let Some(limit) = query.limit {
+        items.truncate(limit);
+    }
     Json(items)
 }
 
 async fn experimental_sessions(State(state): State<AppState>) -> Json<Vec<Value>> {
-    let sessions = list_sessions(State(state)).await.0;
+    let sessions = state.sessions.read().await;
+    let mut sessions = futures::future::join_all(
+        sessions
+            .values()
+            .map(|record| async { record.lock().await.info.clone() }),
+    )
+    .await;
+    sessions.sort_by(|a, b| b.time.updated.cmp(&a.time.updated));
     Json(
         sessions
             .into_iter()
@@ -1155,7 +1272,9 @@ async fn session_children(
 }
 
 async fn v2_sessions(State(state): State<AppState>) -> Json<Value> {
-    let sessions = list_sessions(State(state)).await.0;
+    let sessions = list_sessions(State(state), Query(ListSessionsQuery::default()))
+        .await
+        .0;
     Json(json!({ "items": sessions, "cursor": {} }))
 }
 
@@ -1311,7 +1430,7 @@ async fn prompt_session_async(
         let assistant_id = start_live_assistant(&mut record, user.info.id(), directory.clone());
         record.messages.push(user.clone());
         record.info.touch();
-        state.publish_message(&user);
+        state.publish_message(&record.info.directory, &user);
         (Arc::clone(&record.rpc), user, directory, assistant_id)
     };
 
@@ -1370,7 +1489,7 @@ async fn prompt_impl(
         let assistant_id = start_live_assistant(&mut record, user.info.id(), directory.clone());
         record.messages.push(user.clone());
         record.info.touch();
-        state.publish_message(&user);
+        state.publish_message(&record.info.directory, &user);
         (Arc::clone(&record.rpc), user, directory, assistant_id)
     };
 
@@ -1449,12 +1568,12 @@ async fn record_assistant_from_event(
         }
         record.messages.push(assistant.clone());
         record.info.touch();
-        state.publish_message_snapshot(&assistant);
+        state.publish_message_snapshot(&record.info.directory, &assistant);
         return Ok(assistant);
     }
     record.messages.push(assistant.clone());
     record.info.touch();
-    state.publish_message(&assistant);
+    state.publish_message(&record.info.directory, &assistant);
     Ok(assistant)
 }
 
@@ -1509,14 +1628,17 @@ async fn fork_session(
         Some(format!("{} (fork #1)", parent.info.title))
     };
     state
-        .create_session(Some(CreateSessionPayload {
-            parent_id: Some(session_id),
-            title,
-            agent: None,
-            model: None,
-            permission: None,
-            workspace_id: None,
-        }))
+        .create_session(
+            Some(CreateSessionPayload {
+                parent_id: Some(session_id),
+                title,
+                agent: None,
+                model: None,
+                permission: None,
+                workspace_id: None,
+            }),
+            None,
+        )
         .await
         .map(Json)
 }
@@ -1567,8 +1689,14 @@ async fn echo_session(
     Ok(Json(record.lock().await.info.clone()))
 }
 
-async fn paths(State(state): State<AppState>) -> Json<Value> {
-    let directory = state.config.directory.display().to_string();
+async fn paths(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let directory = query
+        .get("directory")
+        .cloned()
+        .unwrap_or_else(|| state.config.directory.display().to_string());
     let home = dirs::home_dir().map_or_else(|| ".".to_string(), path_to_string);
     Json(json!({
         "home": home,
@@ -1703,15 +1831,22 @@ async fn file_content(
 }
 
 async fn project_current(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "id": state.project_id.clone(),
-        "name": state.config.directory.file_name().and_then(|n| n.to_str()),
-        "worktree": state.config.directory.display().to_string(),
-    }))
+    Json(project_info(&state))
 }
 
 async fn project_list(State(state): State<AppState>) -> Json<Vec<Value>> {
-    Json(vec![project_current(State(state)).await.0])
+    Json(vec![project_info(&state)])
+}
+
+fn project_info(state: &AppState) -> Value {
+    let now = now_ms();
+    json!({
+        "id": state.project_id.clone(),
+        "name": state.config.directory.file_name().and_then(|n| n.to_str()),
+        "worktree": state.config.directory.display().to_string(),
+        "time": { "created": now, "updated": now },
+        "sandboxes": [],
+    })
 }
 
 async fn vcs_info(State(state): State<AppState>) -> Json<Value> {
@@ -1906,9 +2041,11 @@ async fn worktree_create(State(state): State<AppState>) -> Json<Value> {
 async fn workspace_create(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "id": ids::workspace_id(),
+        "type": "local",
         "projectID": state.project_id.clone(),
         "name": "local",
         "directory": state.config.directory.display().to_string(),
+        "timeUsed": 0,
     }))
 }
 
