@@ -38,6 +38,44 @@ npm i -g opencode-ai@latest
 By default, `pi-server` looks for `pi` at `~/.local/bin/pi`. Set `PI_BIN_PATH`
 if your install puts it somewhere else.
 
+Install `pi-server` from GitHub releases:
+
+```sh
+curl -fsSL "https://raw.githubusercontent.com/mikesoylu/pi-server/main/setup.sh?$(date +%s)" | bash
+```
+
+The installer detects Linux architecture and libc/runtime, then installs the
+matching release archive for Debian/glibc or Alpine/musl into `~/.local/bin`.
+
+Pinned and custom installs:
+
+```sh
+# install a specific release tag
+curl -fsSL "https://raw.githubusercontent.com/mikesoylu/pi-server/main/setup.sh?$(date +%s)" | \
+  bash -s -- --version v0.1.0
+
+# install somewhere else
+curl -fsSL "https://raw.githubusercontent.com/mikesoylu/pi-server/main/setup.sh?$(date +%s)" | \
+  bash -s -- --dest /usr/local/bin
+```
+
+#### Dockerfile Example
+
+```Dockerfile
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl tar \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://raw.githubusercontent.com/mikesoylu/pi-server/main/setup.sh?$(date +%s)" \
+  | bash -s -- --dest /usr/local/bin
+
+EXPOSE 4096
+ENTRYPOINT ["pi-server"]
+CMD ["--hostname", "0.0.0.0", "--port", "4096"]
+```
+
 Build and run:
 
 ```sh
