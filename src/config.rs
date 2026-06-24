@@ -52,9 +52,15 @@ impl ServerConfig {
 }
 
 fn default_pi_bin() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/bin/pi")
+    if cfg!(windows) {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("pi/pi.exe")
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local/bin/pi")
+    }
 }
 
 fn default_database() -> PathBuf {
@@ -62,9 +68,15 @@ fn default_database() -> PathBuf {
 }
 
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/share/pi-server")
+    if cfg!(windows) {
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("pi-server")
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local/share/pi-server")
+    }
 }
 
 #[cfg(test)]

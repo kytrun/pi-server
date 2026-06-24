@@ -34,7 +34,16 @@ Install `pi-server` from GitHub releases:
 curl -fsSL "https://raw.githubusercontent.com/mikesoylu/pi-server/main/setup.sh?$(date +%s)" | bash
 ```
 
-The installer detects Linux architecture and libc/runtime, then installs the
+On Windows (PowerShell 7+):
+
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/mikesoylu/pi-server/main/setup.ps1?$(date +%s) | iex"
+```
+
+The installer detects Windows architecture (x86_64 or arm64), downloads the
+matching release archive, and installs into `~\AppData\Local\pi-server\bin`.
+
+The Linux installer detects architecture and libc/runtime, then installs the
 matching release archive for Debian/glibc or Alpine/musl into `~/.local/bin`.
 
 Pinned and custom installs:
@@ -93,7 +102,7 @@ that storage lives under `~/.local/share/pi-server/sessions/`.
 
 ## Release CI
 
-Each push to `main` creates a GitHub prerelease with four binary archives:
+Each push to `main` creates a GitHub prerelease with six binary archives:
 
 | Archive | Rust Target | Runtime |
 | --- | --- | --- |
@@ -101,6 +110,8 @@ Each push to `main` creates a GitHub prerelease with four binary archives:
 | `linux-debian-arm64` | `aarch64-unknown-linux-gnu` | Debian/glibc arm64 |
 | `linux-alpine-amd64` | `x86_64-unknown-linux-musl` | Alpine/musl amd64 |
 | `linux-alpine-arm64` | `aarch64-unknown-linux-musl` | Alpine/musl arm64 |
+| `windows-amd64` | `x86_64-pc-windows-msvc` | Windows amd64 |
+| `windows-arm64` | `aarch64-pc-windows-msvc` | Windows arm64 |
 
 Versioning uses SemVer from `Cargo.toml`:
 

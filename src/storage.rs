@@ -313,8 +313,25 @@ fn git_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn path_to_string(path: &Path) -> String {
-    path.canonicalize()
+    let canonical = path
+        .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
-        .to_string()
+        .to_string();
+    strip_windows_unc_prefix(&canonical)
+}
+
+/// On Windows, `canonicalize` may return a path prefixed with `\\?\`
+/// (e.g. `\\?\C:\Users\...`). Strip it for consistent storage/comparison.
+fn strip_windows_unc_prefix(s: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+        if let Some(rest) = s.strip_prefix(r"\??\") {
+            return rest.to_string();
+        }
+    }
+    s.to_string()
 }

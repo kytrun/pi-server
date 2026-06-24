@@ -2149,8 +2149,7 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let fake_pi = tmp.path().join("fake-pi");
-        write_fake_pi(&fake_pi);
+        let fake_pi = write_fake_pi(&tmp.path().join("fake-pi"));
         let workdir = tmp.path().join("workdir");
         fs::create_dir(&workdir).expect("workdir");
         Self {
@@ -2563,11 +2562,28 @@ fn normalize_opencode_path(path: &str) -> String {
     param_re.replace_all(path, "{$1}").to_string()
 }
 
-fn write_fake_pi(path: &Path) {
-    let mut file = fs::File::create(path).expect("create fake pi");
+fn write_fake_pi(path: &Path) -> PathBuf {
+    // On Windows, write a .bat wrapper so Command::new can invoke it directly.
+    // The batch file uses the Python -x polyglot trick: Python skips the first
+    // line (the @echo off) and parses the rest as a normal script.
+    let actual_path = if cfg!(windows) {
+        path.with_extension("bat")
+    } else {
+        path.to_path_buf()
+    };
+
+    let mut file = fs::File::create(&actual_path).expect("create fake pi");
+
+    if cfg!(windows) {
+        file.write_all(b"@echo off & python -x \"%~f0\" %* & exit /b\r\n")
+            .expect("write fake pi bat header");
+    } else {
+        file.write_all(b"#!/usr/bin/env python3\n")
+            .expect("write fake pi shebang");
+    }
+
     file.write_all(
-        br#"#!/usr/bin/env python3
-import json
+        br#"import json
 import os
 import sys
 
@@ -2734,13 +2750,17 @@ for line in sys.stdin:
         print(json.dumps({"type": "response", "id": request_id, "command": command, "success": True}), flush=True)
 "#,
     )
-    .expect("write fake pi");
+    .expect("write fake pi body");
+
+    drop(file);
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path).expect("fake pi metadata").permissions();
+        let mut permissions = fs::metadata(&actual_path).expect("fake pi metadata").permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("chmod fake pi");
+        fs::set_permissions(&actual_path, permissions).expect("chmod fake pi");
     }
+
+    actual_path
 }
