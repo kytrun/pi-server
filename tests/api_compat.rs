@@ -2757,7 +2757,9 @@ for line in sys.stdin:
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&actual_path).expect("fake pi metadata").permissions();
+        let mut permissions = fs::metadata(&actual_path)
+            .expect("fake pi metadata")
+            .permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&actual_path, permissions).expect("chmod fake pi");
     }
